@@ -252,6 +252,8 @@ class Constraints:
     min_altitude: float = 30
     terminal_altitude: float = 100
     safety_margin: float = 20
+    glide_ratio: float = 6.5       # 滑翔比 (水平距离/下降高度)
+    altitude_margin: float = 50    # 高度余量 (m)，用于路径绕行和消高
 
 
 # ============================================================
@@ -323,7 +325,9 @@ class MapManager:
                 max_bank_angle=c.get('max_bank_angle', 30),
                 min_altitude=c.get('min_altitude', 30),
                 terminal_altitude=c.get('terminal_altitude', 100),
-                safety_margin=c.get('safety_margin', 20)
+                safety_margin=c.get('safety_margin', 20),
+                glide_ratio=c.get('glide_ratio', 6.5),
+                altitude_margin=c.get('altitude_margin', 50)
             )
 
         # 随机化
@@ -351,33 +355,182 @@ class MapManager:
         return manager
 
     def _randomize_endpoints(self, cfg: dict):
-        """随机化起点和终点"""
-        # 随机化起点
-        if 'start' in cfg and 'random' in cfg['start']:
-            s = cfg['start']
-            r = s['random']
-            x = np.random.uniform(*r['x_range'])
-            y = np.random.uniform(*r['y_range'])
-            z = np.random.uniform(*r['z_range'])
-            heading = np.random.uniform(0, 2 * np.pi)
-            self.start = Waypoint(x, y, z, heading)
-            print(f"随机起点: ({x:.0f}, {y:.0f}, {z:.0f})")
-
-        # 随机化终点
+        """
+        随机化起点和终点，确保可达性
+        
+        可达性条件 (基于滑翔比):
+            起点高度 >= 水平距离 / 滑翔比 + 高度余量
+        
+        策略:
+            1. 先随机终点
+            2. 计算需要的最小起点高度
+            3. 随机起点时确保高度足够
+        """
+        glide_ratio = self.constraints.glide_ratio
+        altitude_margin = self.constraints.altitude_margin
+        
+        # 1. 先随机化终点
+        target_x, target_y, target_z = 0, 0, 0
         if 'target' in cfg and 'random' in cfg['target']:
             t = cfg['target']
             r = t['random']
-            x = np.random.uniform(*r['x_range'])
-            y = np.random.uniform(*r['y_range'])
-            z = r.get('z', 0)  # 地面高度固定
+            target_x = np.random.uniform(*r['x_range'])
+            target_y = np.random.uniform(*r['y_range'])
+            target_z = r.get('z', 0)  # 地面高度固定
             approach_heading = np.random.uniform(0, 2 * np.pi)
             self.target = LandingTarget(
-                position=np.array([x, y, z]),
+                position=np.array([target_x, target_y, target_z]),
                 radius=t.get('radius', 20),
                 approach_heading=approach_heading,
                 approach_length=t.get('approach_length', 200)
             )
-            print(f"随机终点: ({x:.0f}, {y:.0f}, {z:.0f})")
+            print(f"随机终点: ({target_x:.0f}, {target_y:.0f}, {target_z:.0f})")
+        elif self.target is not None:
+            target_x, target_y, target_z = self.target.position
+        
+        # 2. 随机化起点，确保可达性
+        if 'start' in cfg and 'random' in cfg['start']:
+            s = cfg['start']
+            r = s['random']
+            
+            max_attempts = 100
+            for attempt in range(max_attempts):
+                # 随机 XY
+                start_x = np.random.uniform(*r['x_range'])
+                start_y = np.random.uniform(*r['y_range'])
+                
+                # 计算水平距离
+                horizontal_dist = np.sqrt((start_x - target_x)**2 + (start_y - target_y)**2)
+                
+                # 计算需要的最小高度 (考虑路径可能绕行，乘以 1.3 系数)
+                path_factor = 1.3  # 路径绕行系数
+                min_altitude_required = (horizontal_dist * path_factor) / glide_ratio + target_z + altitude_margin
+                
+                # 随机高度，确保不小于最小需要高度
+                z_range = r['z_range']
+                z_min = max(z_range[0], min_altitude_required)
+                z_max = z_range[1]
+                
+                if z_min <= z_max:
+                    # 可达，生成起点
+                    start_z = np.random.uniform(z_min, z_max)
+                    heading = np.random.uniform(0, 2 * np.pi)
+                    self.start = Waypoint(start_x, start_y, start_z, heading)
+                    
+                    excess_altitude = start_z - (horizontal_dist / glide_ratio + target_z)
+                    print(f"随机起点: ({start_x:.0f}, {start_y:.0f}, {start_z:.0f})")
+                    print(f"  水平距离: {horizontal_dist:.0f}m, 需要最小高度: {min_altitude_required:.0f}m")
+                    print(f"  高度盈余: {excess_altitude:.0f}m (可用于路径绕行/消高)")
+                    return
+                
+                # 当前 XY 无法满足可达性，重试
+                if attempt == max_attempts - 1:
+                    # 最后尝试：强制使用最大高度
+                    start_z = z_range[1]
+                    heading = np.random.uniform(0, 2 * np.pi)
+                    self.start = Waypoint(start_x, start_y, start_z, heading)
+                    
+                    print(f"[警告] 可达性受限，使用最大高度")
+                    print(f"随机起点: ({start_x:.0f}, {start_y:.0f}, {start_z:.0f})")
+                    print(f"  水平距离: {horizontal_dist:.0f}m, 需要最小高度: {min_altitude_required:.0f}m")
+                    
+                    if start_z < min_altitude_required:
+                        print(f"  [警告] 高度不足! 差 {min_altitude_required - start_z:.0f}m")
+                    return
+
+    def check_reachability(self, path_factor: float = 1.3) -> dict:
+        """
+        检查从起点到终点的可达性
+        
+        参数:
+            path_factor: 路径绕行系数 (实际路径长度 / 直线距离)
+        
+        返回:
+            dict: 可达性分析结果
+        """
+        if self.start is None or self.target is None:
+            return {'reachable': False, 'reason': '起点或终点未设置'}
+        
+        start_pos = self.start.to_array()
+        target_pos = self.target.position
+        
+        # 水平距离
+        horizontal_dist = np.linalg.norm(start_pos[:2] - target_pos[:2])
+        
+        # 高度差
+        altitude_available = start_pos[2] - target_pos[2]
+        
+        # 滑翔比约束
+        glide_ratio = self.constraints.glide_ratio
+        altitude_margin = self.constraints.altitude_margin
+        
+        # 直线飞行需要的高度
+        altitude_needed_direct = horizontal_dist / glide_ratio
+        
+        # 考虑绕行的高度需求
+        altitude_needed_with_path = (horizontal_dist * path_factor) / glide_ratio + altitude_margin
+        
+        # 高度盈余
+        altitude_excess = altitude_available - altitude_needed_direct
+        altitude_excess_with_margin = altitude_available - altitude_needed_with_path
+        
+        # 消高需求 (如果高度过剩)
+        spiral_altitude = 0
+        spiral_turns = 0
+        if altitude_excess_with_margin > 0:
+            # 高度盈余，可能需要消高
+            # 每圈消耗高度 = 2π × 转弯半径 / 滑翔比
+            turn_radius = self.constraints.min_turn_radius
+            altitude_per_turn = 2 * np.pi * turn_radius / glide_ratio
+            spiral_altitude = altitude_excess_with_margin
+            spiral_turns = spiral_altitude / altitude_per_turn
+        
+        result = {
+            'reachable': altitude_excess >= 0,
+            'horizontal_distance': horizontal_dist,
+            'altitude_available': altitude_available,
+            'altitude_needed_direct': altitude_needed_direct,
+            'altitude_needed_with_path': altitude_needed_with_path,
+            'altitude_excess': altitude_excess,
+            'altitude_excess_with_margin': altitude_excess_with_margin,
+            'glide_ratio': glide_ratio,
+            'spiral_altitude': spiral_altitude,
+            'spiral_turns': spiral_turns,
+        }
+        
+        return result
+    
+    def print_reachability_report(self):
+        """打印可达性报告"""
+        r = self.check_reachability()
+        
+        print("\n" + "=" * 50)
+        print("  可达性分析报告")
+        print("=" * 50)
+        print(f"  起点: ({self.start.x:.0f}, {self.start.y:.0f}, {self.start.z:.0f})")
+        print(f"  终点: ({self.target.position[0]:.0f}, {self.target.position[1]:.0f}, {self.target.position[2]:.0f})")
+        print(f"  水平距离: {r['horizontal_distance']:.0f}m")
+        print(f"  可用高度: {r['altitude_available']:.0f}m")
+        print(f"  滑翔比: {r['glide_ratio']:.1f}:1")
+        print("-" * 50)
+        print(f"  直线飞行需要高度: {r['altitude_needed_direct']:.0f}m")
+        print(f"  考虑绕行需要高度: {r['altitude_needed_with_path']:.0f}m")
+        print(f"  高度盈余 (直线): {r['altitude_excess']:.0f}m")
+        print(f"  高度盈余 (含余量): {r['altitude_excess_with_margin']:.0f}m")
+        print("-" * 50)
+        
+        if r['reachable']:
+            print("  [✓] 可达")
+            if r['spiral_turns'] > 0.5:
+                print(f"  [!] 建议消高: {r['spiral_altitude']:.0f}m (约 {r['spiral_turns']:.1f} 圈)")
+        else:
+            deficit = -r['altitude_excess']
+            print(f"  [✗] 不可达! 高度不足 {deficit:.0f}m")
+            print(f"      建议: 提高起点高度至 {self.start.z + deficit + 50:.0f}m 以上")
+        
+        print("=" * 50 + "\n")
+        
+        return r
 
     def _create_obstacle(self, zone: dict) -> Optional[Obstacle]:
         """根据配置创建障碍物"""

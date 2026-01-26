@@ -15,13 +15,14 @@ bounds:
 start:
   x: 0
   y: 0
-  z: 1000
+  z: 400                    # 初始高度 400m (需足够高以到达目标)
   heading: 0  # 初始航向 (deg)
   # 随机化参数 (randomization.enabled=true时生效)
+  # 注意: 高度范围会根据滑翔比自动调整以确保可达性
   random:
-    x_range: [-200, 300]    # x随机范围
-    y_range: [-200, 300]    # y随机范围
-    z_range: [800, 1200]    # 高度随机范围 (高空)
+    x_range: [-100, 200]    # x随机范围
+    y_range: [-100, 200]    # y随机范围
+    z_range: [350, 600]     # 高度随机范围 (需要足够高度到达目标)
 
 # ---------- 目标着陆区 ----------
 target:
@@ -132,9 +133,11 @@ corridor:
 constraints:
   min_turn_radius: 50
   max_bank_angle: 30
-  min_altitude: 30
-  terminal_altitude: 100
-  safety_margin: 20
+  min_altitude: 20           # 最低飞行高度
+  terminal_altitude: 20      # 进场高度
+  safety_margin: 15
+  glide_ratio: 6.5           # 滑翔比 (从开环测试得到)
+  altitude_margin: 50        # 高度余量 (m)，用于路径绕行和消高
 
 # ---------- 轨迹参数 ----------
 trajectory:

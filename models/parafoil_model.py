@@ -533,28 +533,3 @@ def simulate(y0, t_span, para, dt=0.01, update_density=True):
     return t, y
 
 
-# ============================================================
-#                     主程序入口
-# ============================================================
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="翼伞无人机动力学仿真")
-    parser.add_argument("--config", type=str, required=True, help="配置文件路径")
-    parser.add_argument("--dt", type=float, default=0.02, help="积分步长 (默认: 0.02)")
-    parser.add_argument("--duration", type=float, default=60, help="仿真时长 (默认: 60s)")
-    args = parser.parse_args()
-
-    # 加载参数
-    para = ParafoilParams.from_yaml(args.config)
-
-    # 初始状态
-    y0 = np.zeros(20)
-    y0[2] = 1000        # 初始高度 1000m (z向上为正)
-    y0[8] = 10          # 初始前向速度 10 m/s
-    y0[10] = 5          # 初始下沉速度 5 m/s
-
-    # 运行仿真
-    t, y = simulate(y0, (0, args.duration), para, dt=args.dt)
-
-    print(f"仿真完成: {len(t)} 个时间步")
-    print(f"最终位置: x={y[-1,0]:.1f}m, y={y[-1,1]:.1f}m, z={y[-1,2]:.1f}m")

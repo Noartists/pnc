@@ -103,12 +103,15 @@ class RRTStarPlanner:
         iterations = 0
 
         # 创建进度条
+        pbar = None
         if HAS_TQDM:
-            pbar = tqdm(total=self.max_iterations, desc="RRT* Planning", 
-                       bar_format='{l_bar}{bar:30}{r_bar}{bar:-10b}',
-                       ncols=80)
-        else:
-            pbar = None
+            from tqdm import tqdm
+            pbar = tqdm(
+                desc="    RRT* 规划中",
+                unit=" iter",
+                dynamic_ncols=True,
+                leave=True
+            )
 
         # RRT* 主循环
         for i in range(self.max_iterations):
@@ -116,7 +119,8 @@ class RRTStarPlanner:
 
             # 超时检查
             if time.time() - start_time > max_time:
-                if pbar:
+                if pbar is not None:
+                    pbar.set_postfix_str(f"节点:{len(self.nodes)} | 超时!")
                     pbar.close()
                 break
 
@@ -135,11 +139,11 @@ class RRTStarPlanner:
 
             # 碰撞检测
             if self.map.is_collision(new_pos):
-                if pbar:
+                if pbar is not None:
                     pbar.update(1)
                 continue
             if self.map.is_path_collision(nearest.position, new_pos):
-                if pbar:
+                if pbar is not None:
                     pbar.update(1)
                 continue
 
@@ -166,9 +170,9 @@ class RRTStarPlanner:
             self._rewire(new_idx, near_indices)
 
             # 更新进度条
-            if pbar:
+            if pbar is not None:
                 pbar.update(1)
-                pbar.set_postfix({'nodes': len(self.nodes), 'found': self.goal_reached})
+                pbar.set_postfix_str(f"节点:{len(self.nodes)}")
 
             # 检查是否到达目标
             if not self.goal_reached:  # 只在第一次找到时处理
@@ -181,13 +185,18 @@ class RRTStarPlanner:
                         goal_node = RRTNode(goal, new_idx, goal_cost)
                         self.nodes.append(goal_node)
 
-                        # 快速模式：找到就停止；注释掉下面这行可继续优化
-                        if pbar:
+                        # 更新进度条显示成功
+                        if pbar is not None:
+                            pbar.set_postfix_str(f"节点:{len(self.nodes)} | ✓ 找到路径!")
                             pbar.close()
                         break
 
-        if pbar and not pbar.disable:
-            pbar.close()
+        # 确保进度条关闭
+        if pbar is not None:
+            try:
+                pbar.close()
+            except:
+                pass
 
         # 提取路径
         elapsed = time.time() - start_time
