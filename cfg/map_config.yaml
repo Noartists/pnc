@@ -1,0 +1,156 @@
+# ============================================
+# 翼伞无人机任务地图配置
+# ============================================
+
+# ---------- 地图边界 ----------
+bounds:
+  x_min: -500
+  x_max: 2000
+  y_min: -500
+  y_max: 1500
+  z_min: 0
+  z_max: 1500
+
+# ---------- 起点 ----------
+start:
+  x: 0
+  y: 0
+  z: 1000
+  heading: 0  # 初始航向 (deg)
+  # 随机化参数 (randomization.enabled=true时生效)
+  random:
+    x_range: [-200, 300]    # x随机范围
+    y_range: [-200, 300]    # y随机范围
+    z_range: [800, 1200]    # 高度随机范围 (高空)
+
+# ---------- 目标着陆区 ----------
+target:
+  x: 1500
+  y: 800
+  z: 0
+  radius: 20           # 着陆区半径 (m)
+  approach_heading: 45 # 进场航向 (deg)
+  approach_length: 80  # 进场直线段长度 (m)，缩短以获得更好的入场规划
+  # 随机化参数 (randomization.enabled=true时生效)
+  random:
+    x_range: [1200, 1800]   # x随机范围
+    y_range: [500, 1100]    # y随机范围
+    z: 0                    # 固定在地面
+
+# ---------- 禁飞区 ----------
+no_fly_zones:
+  - name: "建筑A"
+    type: cylinder
+    center: [300, 300]
+    radius: 60
+    z_min: 0
+    z_max: 400
+
+  - name: "建筑B"
+    type: cylinder
+    center: [600, 450]
+    radius: 80
+    z_min: 0
+    z_max: 550
+
+  - name: "建筑C"
+    type: cylinder
+    center: [500, 150]
+    radius: 50
+    z_min: 0
+    z_max: 350
+
+  - name: "建筑D"
+    type: cylinder
+    center: [900, 600]
+    radius: 100
+    z_min: 0
+    z_max: 600
+
+  - name: "建筑E"
+    type: cylinder
+    center: [850, 300]
+    radius: 70
+    z_min: 0
+    z_max: 450
+
+  - name: "建筑F"
+    type: cylinder
+    center: [1100, 500]
+    radius: 90
+    z_min: 0
+    z_max: 500
+
+  - name: "建筑G"
+    type: cylinder
+    center: [1200, 800]
+    radius: 65
+    z_min: 0
+    z_max: 380
+
+  - name: "建筑H"
+    type: cylinder
+    center: [700, 750]
+    radius: 75
+    z_min: 0
+    z_max: 420
+
+  - name: "建筑I"
+    type: polygon
+    vertices: [[1000, 150], [1150, 150], [1180, 300], [1050, 350], [950, 280]]
+    z_min: 0
+    z_max: 480
+
+  - name: "建筑J"
+    type: cylinder
+    center: [400, 650]
+    radius: 55
+    z_min: 0
+    z_max: 320
+
+  - name: "高空禁区"
+    type: cylinder
+    center: [200, 800]
+    radius: 120
+    z_min: 600
+    z_max: 1200
+
+# ---------- 空域走廊 ----------
+corridor:
+  enabled: true
+  boundary: [
+    [-100, -100],
+    [1800, -100],
+    [1900, 1200],
+    [1600, 1400],
+    [-100, 1200]
+  ]
+  z_min: 0
+  z_max: 1200
+
+# ---------- 约束参数 ----------
+constraints:
+  min_turn_radius: 50
+  max_bank_angle: 30
+  min_altitude: 30
+  terminal_altitude: 100
+  safety_margin: 20
+
+# ---------- 轨迹参数 ----------
+trajectory:
+  reference_speed: 12.0    # 参考飞行速度 (m/s)，取10-15范围中值
+  control_frequency: 100   # 控制频率 (Hz)
+  sample_dt: 0.01          # 采样周期 (s) = 1/freq
+
+# ---------- 随机化配置 ----------
+# 启用后会覆盖上面手动定义的禁飞区，并随机化起点终点
+randomization:
+  enabled: true           # 是否启用随机化 (true/false)
+  seed: 42                # 随机种子 (null=每次不同, 固定数字=可复现)
+  randomize_endpoints: true  # 是否随机化起点终点
+  n_obstacles: 20         # 障碍物数量
+  radius_range: [40, 100]   # 半径范围 (m)
+  height_range: [250, 1000] # 高度范围 (m)
+  clear_radius_start: 150   # 起点周围清空半径
+  clear_radius_target: 200  # 目标周围清空半径
+  flight_zone_ratio: 0.75   # 飞行区域内障碍物比例 (0-1)
