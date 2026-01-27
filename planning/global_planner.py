@@ -69,7 +69,7 @@ class RRTStarPlanner:
             self.approach_point = map_manager.target.get_approach_point(terminal_alt)
 
     def plan(self, start: np.ndarray = None, goal: np.ndarray = None,
-             max_time: float = 30.0) -> Tuple[Optional[List[np.ndarray]], dict]:
+             max_time: float = 30.0, add_final_target: bool = True) -> Tuple[Optional[List[np.ndarray]], dict]:
         """
         规划从起点到目标的路径 (考虑入场方向)
 
@@ -80,11 +80,13 @@ class RRTStarPlanner:
             start: 起点 [x, y, z]，默认使用地图起点
             goal: 目标 [x, y, z]，默认使用地图目标
             max_time: 最大规划时间 (秒)
+            add_final_target: 是否在路径末尾添加最终目标点（默认True）
 
         返回:
             path: 路径点列表，失败返回 None
             info: 规划信息字典
         """
+        self._add_final_target = add_final_target  # 保存参数供_extract_path使用
         # 初始化
         if start is None:
             start = self.map.start.to_array()
@@ -208,7 +210,8 @@ class RRTStarPlanner:
         }
 
         if self.goal_reached:
-            path = self._extract_path()
+            # 使用plan调用时传入的参数
+            path = self._extract_path(add_final_target=self._add_final_target)
             info['path_length'] = self._path_length(path)
             return path, info
         else:
@@ -327,10 +330,14 @@ class RRTStarPlanner:
                     node.parent = new_idx
                     node.cost = new_cost
 
-    def _extract_path(self) -> List[np.ndarray]:
-        """从目标回溯提取路径，并添加最终着陆点"""
+    def _extract_path(self, add_final_target: bool = True) -> List[np.ndarray]:
+        """从目标回溯提取路径
+        
+        参数:
+            add_final_target: 是否添加最终着陆点（默认True，plan_with_loiter时设为False）
+        """
         path = []
-        idx = len(self.nodes) - 1  # 目标节点（进场点）
+        idx = len(self.nodes) - 1  # 目标节点
 
         while idx is not None:
             path.append(self.nodes[idx].position.copy())
@@ -338,13 +345,205 @@ class RRTStarPlanner:
 
         path.reverse()
 
-        # 添加最终着陆点（如果进场点和目标不同）
-        if self.map.target is not None:
+        # 添加最终着陆点（如果需要且进场点和目标不同）
+        if add_final_target and self.map.target is not None:
             final = self.map.target.position.copy()
             if np.linalg.norm(path[-1] - final) > 1.0:
                 path.append(final)
 
         return path
+    
+    def plan_with_loiter(self, start: np.ndarray = None, 
+                         max_time: float = 30.0) -> Tuple[Optional[List[np.ndarray]], dict]:
+        """
+        规划包含画圆消高的完整路径
+        
+        规划流程：
+        1. 计算画圆参数（位置、半径、圈数）
+        2. RRT*规划：起点 → 画圆入口点
+        3. 生成画圆航点（检查碰撞）
+        4. 添加进场航点（检查碰撞）
+        5. 返回完整路径
+        
+        返回:
+            path: 完整路径点列表（包含画圆），失败返回 None
+            info: 规划信息字典
+        """
+        if start is None:
+            start = self.map.start.to_array()
+        
+        target = self.map.target
+        constraints = self.map.constraints
+        
+        if target is None:
+            return None, {'success': False, 'error': 'No target defined'}
+        
+        target_pos = target.position.copy()
+        approach_heading = target.approach_heading
+        approach_length = target.approach_length
+        terminal_altitude = constraints.terminal_altitude
+        glide_ratio = constraints.glide_ratio
+        altitude_margin = constraints.altitude_margin
+        min_turn_radius = constraints.min_turn_radius
+        
+        # ======== Step 1: 计算画圆参数 ========
+        # 计算需要的额外水平距离
+        start_z = start[2]
+        target_z = target_pos[2]
+        
+        # 基于滑翔比计算需要的最小水平距离
+        min_horizontal = (start_z - target_z - altitude_margin) * glide_ratio
+        
+        # 估算直线距离（起点到目标）
+        direct_distance = np.linalg.norm(start[:2] - target_pos[:2])
+        
+        # 需要的额外距离（用于画圆消高）
+        extra_distance = max(0.0, min_horizontal - direct_distance)
+        
+        # 计算画圆参数
+        loiter_radius = 1.5 * min_turn_radius  # 使用1.5倍最小转弯半径
+        loiter_loops = 0
+        if extra_distance > 1e-3:
+            loiter_loops = int(np.ceil(extra_distance / (2 * np.pi * loiter_radius)))
+        
+        # ======== Step 2: 计算画圆位置和入口点 ========
+        # 画圆位置在进场点附近，高度为进场高度
+        loiter_altitude = terminal_altitude
+        
+        # 进场点（画圆出口 = 进场点）
+        approach_point = target_pos.copy()
+        approach_point[0] -= approach_length * np.cos(approach_heading)
+        approach_point[1] -= approach_length * np.sin(approach_heading)
+        approach_point[2] = loiter_altitude
+        
+        # 画圆中心（在进场点的侧面）
+        # CCW方向：中心在进场点的左侧
+        theta_center = approach_heading - np.pi / 2.0
+        loiter_center = approach_point.copy()
+        loiter_center[:2] -= loiter_radius * np.array([np.cos(theta_center), np.sin(theta_center)])
+        
+        # 检查画圆区域是否有碰撞
+        loiter_direction = "ccw"
+        if not self._circle_ok(loiter_center, loiter_radius, loiter_altitude):
+            # 尝试CW方向
+            theta_center = approach_heading + np.pi / 2.0
+            loiter_center = approach_point.copy()
+            loiter_center[:2] -= loiter_radius * np.array([np.cos(theta_center), np.sin(theta_center)])
+            loiter_direction = "cw"
+            
+            if not self._circle_ok(loiter_center, loiter_radius, loiter_altitude):
+                # 两个方向都不行，尝试更大的半径
+                loiter_radius = 2.0 * min_turn_radius
+                loiter_loops = int(np.ceil(extra_distance / (2 * np.pi * loiter_radius))) if extra_distance > 1e-3 else 0
+                
+                theta_center = approach_heading - np.pi / 2.0
+                loiter_center = approach_point.copy()
+                loiter_center[:2] -= loiter_radius * np.array([np.cos(theta_center), np.sin(theta_center)])
+                loiter_direction = "ccw"
+                
+                if not self._circle_ok(loiter_center, loiter_radius, loiter_altitude):
+                    # 还是不行，跳过画圆
+                    loiter_loops = 0
+                    print(f"    [警告] 无法找到安全的画圆区域，跳过画圆消高")
+        
+        # 计算画圆入口点
+        if loiter_loops > 0:
+            total_angle = 2 * np.pi * loiter_loops
+            if loiter_direction == "ccw":
+                theta_end = approach_heading - np.pi / 2.0
+                theta_start = theta_end - total_angle
+                tangent_sign = 1.0
+            else:
+                theta_end = approach_heading + np.pi / 2.0
+                theta_start = theta_end + total_angle
+                tangent_sign = -1.0
+            
+            # 画圆入口点
+            loiter_entry = loiter_center + np.array([
+                loiter_radius * np.cos(theta_start),
+                loiter_radius * np.sin(theta_start),
+                loiter_altitude
+            ])
+            
+            # RRT*的目标是画圆入口点
+            rrt_goal = loiter_entry.copy()
+        else:
+            # 不需要画圆，RRT*的目标是进场点
+            rrt_goal = approach_point.copy()
+            theta_start = 0
+            theta_end = 0
+            tangent_sign = 1.0
+        
+        # ======== Step 3: RRT*规划到画圆入口 ========
+        print(f"    [规划] RRT*目标: {'画圆入口点' if loiter_loops > 0 else '进场点'} (高度{rrt_goal[2]:.1f}m)")
+        
+        # 不添加最终目标，因为后面会手动添加画圆和进场航点
+        path_to_entry, info = self.plan(start=start, goal=rrt_goal, max_time=max_time, add_final_target=False)
+        
+        if path_to_entry is None:
+            return None, info
+        
+        # ======== Step 4: 生成画圆航点 ========
+        loiter_waypoints = []
+        if loiter_loops > 0:
+            n_points_per_loop = 36  # 每圈36个点（每10度一个点）
+            n_total_points = loiter_loops * n_points_per_loop
+            thetas = np.linspace(theta_start, theta_end, n_total_points + 1)
+            
+            for theta in thetas:
+                wp = loiter_center + np.array([
+                    loiter_radius * np.cos(theta),
+                    loiter_radius * np.sin(theta),
+                    loiter_altitude
+                ])
+                loiter_waypoints.append(wp)
+            
+            print(f"    [规划] 画圆消高: {loiter_loops}圈, 半径={loiter_radius:.1f}m, {len(loiter_waypoints)}个航点")
+        
+        # ======== Step 5: 生成进场航点 ========
+        approach_waypoints = []
+        # 从画圆出口（或进场点）到目标的直线
+        if loiter_loops > 0:
+            start_approach = loiter_waypoints[-1]  # 画圆出口
+        else:
+            start_approach = path_to_entry[-1] if path_to_entry else rrt_goal
+        
+        # 检查进场路径是否有碰撞
+        if not self.map.is_path_collision(start_approach, target_pos):
+            # 生成进场航点（从进场点到目标）
+            n_approach_points = max(int(approach_length / 10), 2)  # 每10m一个点
+            for i in range(1, n_approach_points + 1):
+                alpha = i / n_approach_points
+                wp = start_approach + alpha * (target_pos - start_approach)
+                approach_waypoints.append(wp)
+            print(f"    [规划] 进场直线: {len(approach_waypoints)}个航点")
+        else:
+            print(f"    [警告] 进场路径有碰撞，需要额外规划")
+            # TODO: 可以在这里添加额外的RRT*规划
+            approach_waypoints = [target_pos.copy()]
+        
+        # ======== Step 6: 合并所有航点 ========
+        full_path = path_to_entry.copy()
+        full_path.extend(loiter_waypoints)
+        full_path.extend(approach_waypoints)
+        
+        # 更新info
+        info['loiter_loops'] = loiter_loops
+        info['loiter_radius'] = loiter_radius if loiter_loops > 0 else 0
+        info['loiter_direction'] = loiter_direction if loiter_loops > 0 else None
+        info['total_waypoints'] = len(full_path)
+        info['path_length'] = self._path_length(full_path)
+        
+        return full_path, info
+    
+    def _circle_ok(self, center: np.ndarray, radius: float, z: float) -> bool:
+        """检查画圆区域是否有碰撞"""
+        for theta in np.linspace(0, 2 * np.pi, 36, endpoint=False):
+            pt = center + np.array([radius * np.cos(theta), radius * np.sin(theta), 0.0])
+            pt[2] = z
+            if self.map.is_collision(pt):
+                return False
+        return True
 
     def _path_length(self, path: List[np.ndarray]) -> float:
         """计算路径长度"""

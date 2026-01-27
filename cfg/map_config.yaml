@@ -134,7 +134,7 @@ constraints:
   min_turn_radius: 50
   max_bank_angle: 30
   min_altitude: 20           # 最低飞行高度
-  terminal_altitude: 20      # 进场高度
+  terminal_altitude: 50      # 进场高度
   safety_margin: 15
   glide_ratio: 6.5           # 滑翔比 (从开环测试得到)
   altitude_margin: 50        # 高度余量 (m)，用于路径绕行和消高

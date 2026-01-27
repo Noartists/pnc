@@ -29,7 +29,7 @@ if ROOT_DIR not in sys.path:
 from planning.map_manager import MapManager
 from planning.global_planner import RRTStarPlanner
 from planning.path_smoother import PathSmoother
-from planning.trajectory import Trajectory, TrajectoryPoint
+from planning.trajectory import Trajectory
 from control.adrc_controller import ParafoilADRCController, ControlOutput
 from models.parafoil_model import ParafoilParams, parafoil_dynamics
 
@@ -128,6 +128,7 @@ class ClosedLoopSimulator:
             map_cfg = yaml.safe_load(f)
         traj_cfg = map_cfg.get('trajectory', {}) if isinstance(map_cfg, dict) else {}
         reference_speed = traj_cfg.get('reference_speed', 12.0)
+        self.reference_speed = reference_speed
         
         # 检查可达性
         self.map_manager.print_reachability_report()
@@ -204,14 +205,17 @@ class ClosedLoopSimulator:
         
         print(f"    规划完成: {len(path)} 航点, 长度 {info['path_length']:.1f}m")
         
-        # 路径平滑
+        # 路径平滑（包含进场点、盘旋消高和进场直线段）
         print("[4/4] 路径平滑...")
         end_heading = self.map_manager.target.approach_heading if self.map_manager.target else None
-        self.trajectory = self.smoother.smooth(path, end_heading=end_heading, waypoint_density=15)
+        self.trajectory = self.smoother.smooth(
+            path, 
+            end_heading=end_heading, 
+            waypoint_density=15,
+            map_manager=self.map_manager  # 传递map_manager以启用路径优化
+        )
         
         print(f"    生成轨迹: {len(self.trajectory)} 点, 时长 {self.trajectory.duration:.1f}s")
-        
-        # 设置控制器轨迹
         self.controller.set_trajectory(self.trajectory)
         
         return True
