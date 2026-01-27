@@ -141,7 +141,7 @@ constraints:
 
 # ---------- 轨迹参数 ----------
 trajectory:
-  reference_speed: 12.0    # 参考飞行速度 (m/s)，取10-15范围中值
+  reference_speed: 9.0    # 参考飞行速度 (m/s)，取10-15范围中值
   control_frequency: 100   # 控制频率 (Hz)
   sample_dt: 0.01          # 采样周期 (s) = 1/freq
 

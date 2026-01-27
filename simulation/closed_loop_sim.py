@@ -19,6 +19,7 @@ from typing import Tuple, Optional, Dict, List
 from dataclasses import dataclass
 from scipy.integrate import odeint
 import time
+import yaml
 
 # 添加项目根目录到路径
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -121,6 +122,12 @@ class ClosedLoopSimulator:
         # 加载地图
         print("[1/4] 加载地图配置...")
         self.map_manager = MapManager.from_yaml(map_config_path)
+
+        # 读取轨迹参数（参考速度）
+        with open(map_config_path, 'r', encoding='utf-8') as f:
+            map_cfg = yaml.safe_load(f)
+        traj_cfg = map_cfg.get('trajectory', {}) if isinstance(map_cfg, dict) else {}
+        reference_speed = traj_cfg.get('reference_speed', 12.0)
         
         # 检查可达性
         self.map_manager.print_reachability_report()
@@ -133,7 +140,7 @@ class ClosedLoopSimulator:
         self.planner = RRTStarPlanner(self.map_manager)
         self.smoother = PathSmoother(
             turn_radius=self.map_manager.constraints.min_turn_radius,
-            reference_speed=12.0,
+            reference_speed=reference_speed,
             control_frequency=1.0 / control_dt
         )
         
@@ -162,7 +169,7 @@ class ClosedLoopSimulator:
             glide_ratio_min=5.0,      # 最小滑翔比 (最大对称偏转)
             descent_kp=0.5,           # 下降率控制增益
             descent_margin=1.2,       # 滑翔比余量系数
-            reference_speed=12.0,
+            reference_speed=reference_speed,
             lookahead_distance=100.0, # 大：更平滑的转弯
             max_deflection=0.5,       # 增加：允许更大偏转用于下降率控制
             dt=control_dt
