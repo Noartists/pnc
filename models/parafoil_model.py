@@ -55,9 +55,21 @@ def omega_to_euler_rate(phi, theta):
     """
     角速度到欧拉角变化率的转换矩阵
     d(euler)/dt = T @ omega
+    
+    注意: 当 theta = ±90° 时会出现奇点（tan(theta) → ∞）
+    需要限制 theta 在合理范围内（如 [-85°, 85°]）
     """
+    # 限制 theta 避免奇点
+    theta_safe = np.clip(theta, -np.radians(85), np.radians(85))
+    
     cp, sp = np.cos(phi), np.sin(phi)
-    ct, tt = np.cos(theta), np.tan(theta)
+    ct = np.cos(theta_safe)
+    
+    # 避免除零：当 cos(theta) 接近0时，使用大数近似
+    if abs(ct) < 1e-6:
+        ct = np.sign(ct) * 1e-6
+    
+    tt = np.sin(theta_safe) / ct  # tan(theta) = sin(theta) / cos(theta)
 
     return np.array([
         [1, sp*tt, cp*tt],
@@ -320,9 +332,10 @@ def parafoil_dynamics(y, t, para):
     Ip = para.mp / 12 * 0.5 * np.eye(3)
 
     # -------- 坐标变换矩阵 --------
-    R_cr = euler_to_dcm(0, para.miu, 0)       # 伞体→安装坐标系
-    R_cp = euler_to_dcm(psi_r, theta_r, 0)    # 伞体→负载坐标系
-    R_nb = euler_to_dcm(psi, theta, phi)      # 惯性→伞体坐标系
+    # euler_to_dcm(phi, theta, psi) 参数顺序: 滚转, 俯仰, 偏航
+    R_cr = euler_to_dcm(0, para.miu, 0)       # 伞体→安装坐标系 (只有俯仰角)
+    R_cp = euler_to_dcm(0, theta_r, psi_r)    # 伞体→负载坐标系 (俯仰和偏航)
+    R_nb = euler_to_dcm(phi, theta, psi)      # 惯性→伞体坐标系 (滚转, 俯仰, 偏航)
 
     # 安装坐标系中的总惯量
     T_cr = np.block([
@@ -478,13 +491,15 @@ def parafoil_dynamics(y, t, para):
     d_euler = omega_to_euler_rate(phi, theta) @ w_c
 
     # 惯性坐标系中的速度
-    # 坐标系约定: x向前, y向左, z向上 (右手系)
+    # 坐标系约定: NED (North-East-Down) 标准航空惯性系
+    # 但z轴取反使向上为正 (North-East-Up)
+    # psi=0: 朝北(+X), psi=90°: 朝东(+Y)
     v_inertial = R_nb.T @ v_c
-    v_inertial[1, 0] = -v_inertial[1, 0]  # y取反，向左为正
-    v_inertial[2, 0] = -v_inertial[2, 0]  # z取反，向上为正
+    # 不再取反y，保持标准NE方向
+    v_inertial[2, 0] = -v_inertial[2, 0]  # z取反，向上为正 (NED -> NEU)
 
     dydt = np.zeros(20)
-    dydt[0:3] = v_inertial.flatten()      # 位置导数 (z为高度，向上为正)
+    dydt[0:3] = v_inertial.flatten()      # 位置导数 (NEU坐标系)
     dydt[3:6] = d_euler.flatten()         # 姿态角导数
     dydt[6] = d_theta_r                   # 相对俯仰角导数
     dydt[7] = d_psi_r                     # 相对偏航角导数

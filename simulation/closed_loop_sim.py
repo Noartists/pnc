@@ -82,9 +82,13 @@ class SimulationLog:
             'ref_heading': np.array(self.ref_heading),
             'delta_left': np.array([c.delta_left for c in self.control]),
             'delta_right': np.array([c.delta_right for c in self.control]),
+            'delta_symmetric': np.array([c.delta_symmetric for c in self.control]),
+            'delta_asymmetric': np.array([c.delta_asymmetric for c in self.control]),
             'cross_track_error': np.array([c.cross_track_error for c in self.control]),
             'along_track_error': np.array([c.along_track_error for c in self.control]),
             'heading_error': np.array([c.heading_error for c in self.control]),
+            'glide_ratio_required': np.array([c.glide_ratio_required for c in self.control]),
+            'glide_ratio_current': np.array([c.glide_ratio_current for c in self.control]),
         }
 
 
@@ -142,18 +146,32 @@ class ClosedLoopSimulator:
         # lateral_kp:        横向误差→航向修正增益，越大路径跟踪越紧，太大会震荡
         # lookahead_distance: 前视距离，越大转弯越平滑，太大会切弯
         # max_deflection:    最大操纵绳偏转量 [0,1]
+        # glide_ratio_natural: 自然滑翔比，无对称偏转时的L/D (约11.0)
+        # glide_ratio_min:   最小滑翔比，最大对称偏转时的L/D (约5.0)
+        # descent_kp:        下降率控制增益
+        # descent_margin:    滑翔比余量系数，>1表示保守
         # ==========================================
+        # 翼伞转弯是通过滚转实现的，响应较慢，需要保守的控制参数
         self.controller = ParafoilADRCController(
-            heading_kp=1.0,           # 降低：减少震荡 (原2.5)
-            heading_kd=0.3,           # 降低：减少过度阻尼 (原0.8)
-            heading_eso_omega=10.0,   # 降低：减少噪声敏感 (原25.0)
-            heading_td_r=20.0,        # 降低：更平滑的参考过渡 (默认30)
-            lateral_kp=0.003,         # 降低：减少横向修正震荡 (原0.008)
+            heading_kp=0.8,           # 保守：避免过度响应导致滚转失控
+            heading_kd=0.4,           # 适中：阻尼
+            heading_eso_omega=3.0,    # 低：减少噪声和过度补偿
+            heading_td_r=10.0,        # 低：平滑的参考过渡
+            lateral_kp=0.002,         # 低：避免横向误差过度修正
+            glide_ratio_natural=11.0, # 自然滑翔比 (无对称偏转)
+            glide_ratio_min=5.0,      # 最小滑翔比 (最大对称偏转)
+            descent_kp=0.5,           # 下降率控制增益
+            descent_margin=1.2,       # 滑翔比余量系数
             reference_speed=12.0,
-            lookahead_distance=100.0, # 增加：更平滑的转弯 (原60.0)
-            max_deflection=0.6,       # 限制最大偏转
+            lookahead_distance=100.0, # 大：更平滑的转弯
+            max_deflection=0.5,       # 增加：允许更大偏转用于下降率控制
             dt=control_dt
         )
+        
+        # 调试模式（可通过参数控制）
+        self.controller_debug = True  # 设为 True 启用控制器调试输出
+        if self.controller_debug:
+            self.controller.set_debug(True)
         
         # 轨迹和仿真状态
         self.trajectory: Optional[Trajectory] = None
@@ -256,7 +274,14 @@ class ClosedLoopSimulator:
         position = state[0:3]
         euler = state[3:6]
         velocity_body = state[8:11]
-        heading = euler[2]  # psi
+        heading_raw = euler[2]  # psi (可能超出 [-π, π])
+        
+        # 归一化航向角到 [-π, π]
+        heading = heading_raw
+        while heading > np.pi:
+            heading -= 2 * np.pi
+        while heading < -np.pi:
+            heading += 2 * np.pi
         
         # 体坐标系速度转惯性系
         psi = heading
@@ -266,11 +291,11 @@ class ClosedLoopSimulator:
         vz = -velocity_body[2]  # 体坐标系 w 向下为正，惯性系 z 向上为正
         velocity = np.array([vx, vy, vz])
         
-        # 2. 控制器更新
+        # 2. 控制器更新（使用归一化后的航向角）
         ctrl = self.controller.update(
             current_pos=position,
             current_vel=velocity,
-            current_heading=heading,
+            current_heading=heading,  # 已归一化
             t=t
         )
         
@@ -281,6 +306,14 @@ class ClosedLoopSimulator:
         self.para.left = ctrl.delta_left * MAX_DEFLECTION_METERS
         self.para.right = ctrl.delta_right * MAX_DEFLECTION_METERS
         
+        # 调试: 检查控制输入（每100步打印一次）
+        if self.controller_debug and int(t / self.control_dt) % 100 == 0:
+            d_s = min(self.para.left, self.para.right)  # 对称偏转
+            d_a = self.para.left - self.para.right      # 非对称偏转
+            print(f"  [控制输入] left={self.para.left:.3f}m, right={self.para.right:.3f}m")
+            print(f"  [偏转] d_s={d_s:.3f}m (对称/下降), d_a={d_a:.3f}m (非对称/航向)")
+            print(f"  [滑翔比] 所需={ctrl.glide_ratio_required:.1f}, 当前={ctrl.glide_ratio_current:.1f}")
+        
         # 4. 根据高度更新空气密度
         self.para.update_density(position[2])
         
@@ -289,11 +322,65 @@ class ClosedLoopSimulator:
         actual_dt = self.control_dt / n_substeps
         
         next_state = state.copy()
-        for _ in range(n_substeps):
-            dydt = parafoil_dynamics(next_state, t, self.para)
+        for i in range(n_substeps):
+            try:
+                dydt = parafoil_dynamics(next_state, t, self.para)
+            except Exception as e:
+                print(f"[错误] 动力学模型计算失败! t={t:.3f}s, step={i}/{n_substeps}")
+                print(f"  状态[5] (heading) = {np.degrees(next_state[5]):.1f}°")
+                print(f"  错误: {e}")
+                raise
+            
+            # 检查是否有数值异常
+            if np.any(np.isnan(dydt)) or np.any(np.isinf(dydt)):
+                print(f"[错误] 动力学模型返回NaN/Inf! t={t:.3f}s, step={i}/{n_substeps}")
+                print(f"  state[5] (heading) = {np.degrees(next_state[5]):.1f}°")
+                print(f"  dydt[5] (d_heading/dt) = {np.degrees(dydt[5]):.1f}°/s")
+                print(f"  dydt范围: [{np.min(dydt):.2e}, {np.max(dydt):.2e}]")
+                raise ValueError("动力学模型数值异常")
+            
+            # 检查导数是否过大（可能导致数值不稳定）
+            max_derivative = np.max(np.abs(dydt))
+            if max_derivative > 1e6:
+                print(f"[警告] 导数过大! t={t:.3f}s, step={i}/{n_substeps}, max={max_derivative:.2e}")
+            
             next_state = next_state + dydt * actual_dt
+            
+            # 归一化航向角（避免累积超出范围）
+            next_state[5] = self._wrap_angle(next_state[5])
+            
+            # 限制俯仰角和滚转角，避免欧拉角奇点（theta = ±90°）
+            # 限制 theta 在 [-85°, 85°] 范围内
+            theta_max = np.radians(85)
+            if abs(next_state[4]) > theta_max:
+                next_state[4] = np.sign(next_state[4]) * theta_max
+                if self.controller_debug and i == 0:
+                    print(f"  [警告] 俯仰角超出范围，已限制: {np.degrees(next_state[4]):.1f}°")
+            
+            # 限制滚转角在 [-85°, 85°] 范围内
+            if abs(next_state[3]) > theta_max:
+                next_state[3] = np.sign(next_state[3]) * theta_max
+                if self.controller_debug and i == 0:
+                    print(f"  [警告] 滚转角超出范围，已限制: {np.degrees(next_state[3]):.1f}°")
+            
+            # 检查状态是否异常
+            if np.any(np.isnan(next_state)) or np.any(np.isinf(next_state)):
+                print(f"[错误] 状态向量出现NaN/Inf! t={t:.3f}s, step={i}/{n_substeps}")
+                print(f"  next_state[3] (roll) = {np.degrees(next_state[3]):.1f}°")
+                print(f"  next_state[4] (pitch) = {np.degrees(next_state[4]):.1f}°")
+                print(f"  next_state[5] (heading) = {np.degrees(next_state[5]):.1f}°")
+                raise ValueError("状态向量数值异常")
         
         return next_state, ctrl
+    
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        """将角度归一化到 [-pi, pi]"""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
     
     def run(self, 
             max_time: float = None,

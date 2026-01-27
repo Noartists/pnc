@@ -108,18 +108,36 @@ class TD:
         更新跟踪微分器
         
         参数:
-            v: 输入信号 (目标值)
+            v: 输入信号 (目标值，对于航向角需要归一化)
             dt: 时间步长
         
         返回:
             (v1, v2): 跟踪值和其微分
         """
-        fh = fhan(self.v1 - v, self.v2, self.r, self.h)
+        # 归一化输入（如果是航向角）
+        v = TD._wrap_angle(v)
+        
+        # 计算误差（归一化到 [-π, π]）
+        error = TD._wrap_angle(self.v1 - v)
+        
+        fh = fhan(error, self.v2, self.r, self.h)
         
         self.v1 = self.v1 + dt * self.v2
         self.v2 = self.v2 + dt * fh
         
+        # 归一化v1（航向角）
+        self.v1 = TD._wrap_angle(self.v1)
+        
         return self.v1, self.v2
+    
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        """将角度归一化到 [-pi, pi]"""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
 
 
 # ============================================================
@@ -236,7 +254,15 @@ class LinearESO:
     
     def update(self, y: float, u: float, b0: float, dt: float) -> np.ndarray:
         """更新LESO"""
-        e = self.z[0] - y
+        # 归一化输入y和状态z[0]（如果是航向角）
+        # 注意：这里假设y是航向角，对于其他状态可能不需要归一化
+        y_normalized = LinearESO._wrap_angle(y)
+        z0_normalized = LinearESO._wrap_angle(self.z[0])
+        
+        # 计算归一化后的误差
+        e = z0_normalized - y_normalized
+        # 归一化误差到 [-π, π]
+        e = LinearESO._wrap_angle(e)
         
         if self.order == 1:
             dz1 = self.z[1] - self.beta[0] * e + b0 * u
@@ -253,7 +279,19 @@ class LinearESO:
             self.z[1] += dt * dz2
             self.z[2] += dt * dz3
         
+        # 归一化z[0]（航向角估计）
+        self.z[0] = LinearESO._wrap_angle(self.z[0])
+        
         return self.z.copy()
+    
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        """将角度归一化到 [-pi, pi]"""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
 
 
 # ============================================================
@@ -375,33 +413,62 @@ class ADRC:
     
     def reset(self, y0: float = 0.0):
         """重置控制器状态"""
+        # 归一化初始值
+        y0 = self._wrap_angle_static(y0)
         self.td.reset(y0)
         self.eso.reset()
         self.u_last = 0.0
+    
+    @staticmethod
+    def _wrap_angle_static(angle: float) -> float:
+        """将角度归一化到 [-pi, pi]（静态方法）"""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
     
     def update(self, ref: float, y: float, dt: float) -> float:
         """
         更新控制器
         
         参数:
-            ref: 参考值
-            y: 系统输出 (测量值)
+            ref: 参考值（航向角，rad）
+            y: 系统输出（当前航向角，rad）
             dt: 时间步长
         
         返回:
             u: 控制输出
         """
+        # 归一化航向角到 [-π, π]（避免数值爆炸）
+        ref = self._wrap_angle_static(ref)
+        y = self._wrap_angle_static(y)
+        
         # 1. 跟踪微分器: 安排过渡过程
         v1, v2 = self.td.update(ref, dt)
+        
+        # 归一化TD输出（v1是航向角，也需要归一化）
+        v1 = self._wrap_angle_static(v1)
         
         # 2. 扩展状态观测器: 估计状态和扰动
         z = self.eso.update(y, self.u_last, self.b0, dt)
         z1, z2 = z[0], z[1]
         z3 = z[2] if len(z) > 2 else 0.0
         
-        # 3. 计算误差
+        # 归一化ESO状态（z1是航向角估计）
+        z1_normalized = self._wrap_angle_static(z1)
+        
+        # 更新ESO内部状态，避免累积异常值
+        if abs(z1 - z1_normalized) > 0.01:  # 如果归一化后有显著变化
+            self.eso.z[0] = z1_normalized
+            z1 = z1_normalized
+        
+        # 3. 计算误差（使用归一化后的值）
         e1 = v1 - z1  # 位置误差
         e2 = v2 - z2  # 速度误差
+        
+        # 归一化误差 e1（航向误差）
+        e1 = self._wrap_angle_static(e1)
         
         # 4. 非线性状态误差反馈
         u0 = self.sef.compute(e1, e2)
@@ -425,10 +492,14 @@ class ControlOutput:
     """控制输出数据结构"""
     delta_left: float = 0.0        # 左操纵绳偏转 [0, 1]
     delta_right: float = 0.0       # 右操纵绳偏转 [0, 1]
+    delta_symmetric: float = 0.0   # 对称偏转 (下降率控制) [0, 1]
+    delta_asymmetric: float = 0.0  # 非对称偏转 (航向控制) [-1, 1]
     heading_error: float = 0.0     # 航向误差 (rad)
     cross_track_error: float = 0.0 # 横向误差 (m)
     along_track_error: float = 0.0 # 纵向误差 (m)
     altitude_error: float = 0.0    # 高度误差 (m)
+    glide_ratio_required: float = 0.0  # 所需滑翔比
+    glide_ratio_current: float = 0.0   # 当前滑翔比
     ref_heading: float = 0.0       # 参考航向 (rad)
     ref_position: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
@@ -436,13 +507,13 @@ class ControlOutput:
 class ParafoilADRCController:
     """
     翼伞ADRC轨迹跟踪控制器
-    
+
     控制通道:
-    - 航向控制: 通过差动操纵绳控制偏航
-    - 下降率控制: 通过对称操纵绳控制下降率
+    - 航向控制: 通过差动操纵绳控制偏航 (非对称偏转 d_a)
+    - 下降率控制: 通过对称操纵绳控制下降率 (对称偏转 d_s)
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  # 航向控制参数
                  heading_kp: float = 2.0,
                  heading_kd: float = 0.5,
@@ -451,6 +522,11 @@ class ParafoilADRCController:
                  # 横向误差控制参数
                  lateral_kp: float = 0.01,
                  lateral_kd: float = 0.005,
+                 # 下降率控制参数
+                 glide_ratio_natural: float = 11.0,   # 自然滑翔比 (无对称偏转)
+                 glide_ratio_min: float = 5.0,        # 最小滑翔比 (最大对称偏转)
+                 descent_kp: float = 0.5,             # 下降率控制增益
+                 descent_margin: float = 1.2,         # 滑翔比余量系数
                  # 系统参数
                  reference_speed: float = 12.0,
                  min_turn_radius: float = 50.0,
@@ -466,6 +542,10 @@ class ParafoilADRCController:
             heading_td_r: TD快速因子 (越小参考信号过渡越平滑)
             lateral_kp: 横向误差增益 (越大路径跟踪越紧)
             lateral_kd: 横向误差微分增益
+            glide_ratio_natural: 自然滑翔比，无对称偏转时的L/D
+            glide_ratio_min: 最小滑翔比，最大对称偏转时的L/D
+            descent_kp: 下降率控制增益
+            descent_margin: 滑翔比余量系数 (>1表示保守，提前拉绳)
             reference_speed: 参考飞行速度 (m/s)
             min_turn_radius: 最小转弯半径 (m)
             lookahead_distance: 前视距离 (m，越大转弯越平滑)
@@ -477,8 +557,18 @@ class ParafoilADRCController:
         self.lookahead_distance = lookahead_distance
         self.max_deflection = max_deflection
         self.dt = dt
+
+        # 下降率控制参数
+        self.glide_ratio_natural = glide_ratio_natural
+        self.glide_ratio_min = glide_ratio_min
+        self.descent_kp = descent_kp
+        self.descent_margin = descent_margin
         
         # 航向ADRC控制器
+        # b0: 控制增益估计值，需要根据系统特性调整
+        # 翼伞通过滚转转弯，航向响应较慢，b0应该较大以避免过度控制
+        b0_heading = 2.0  # 适中的b0，避免控制输出过大
+
         self.heading_adrc = ADRC(
             td_r=heading_td_r,    # TD快速因子：越小过渡越平滑
             td_h=dt,
@@ -487,8 +577,8 @@ class ParafoilADRCController:
             use_linear_eso=True,
             kp=heading_kp,
             kd=heading_kd,
-            use_linear_sef=False,
-            b0=1.0,
+            use_linear_sef=True,  # 线性SEF，响应更直接
+            b0=b0_heading,
             u_min=-max_deflection,
             u_max=max_deflection
         )
@@ -502,6 +592,10 @@ class ParafoilADRCController:
         self.trajectory = None
         self.current_index = 0
         self.last_heading_ref = None
+        
+        # 调试模式
+        self.debug = False
+        self.debug_counter = 0
     
     def set_trajectory(self, trajectory):
         """
@@ -520,6 +614,85 @@ class ParafoilADRCController:
         self.lateral_error_last = 0.0
         self.current_index = 0
         self.last_heading_ref = None
+        self.debug_counter = 0
+    
+    def set_debug(self, enabled: bool = True):
+        """启用/禁用调试模式"""
+        self.debug = enabled
+
+    def compute_symmetric_deflection(self,
+                                      current_pos: np.ndarray,
+                                      current_vel: np.ndarray) -> Tuple[float, float, float]:
+        """
+        计算对称偏转量用于下降率控制
+
+        基于当前位置和轨迹终点，计算所需的滑翔比，
+        然后映射到对称偏转量。
+
+        参数:
+            current_pos: 当前位置 [x, y, z]
+            current_vel: 当前速度 [vx, vy, vz]
+
+        返回:
+            (delta_s, glide_ratio_required, glide_ratio_current):
+                delta_s: 对称偏转量 [0, max_deflection]
+                glide_ratio_required: 到达目标所需的滑翔比
+                glide_ratio_current: 当前实际滑翔比
+        """
+        if self.trajectory is None or len(self.trajectory) == 0:
+            return 0.0, 0.0, 0.0
+
+        # 获取轨迹终点
+        final_point = self.trajectory[-1]
+        target_pos = final_point.position
+
+        # 计算水平距离和高度差
+        dx = target_pos[0] - current_pos[0]
+        dy = target_pos[1] - current_pos[1]
+        horizontal_distance = np.sqrt(dx**2 + dy**2)
+        altitude_diff = current_pos[2] - target_pos[2]  # 正值表示需要下降
+
+        # 计算当前滑翔比 (水平速度 / 下降速度)
+        v_horizontal = np.sqrt(current_vel[0]**2 + current_vel[1]**2)
+        v_vertical = -current_vel[2]  # 下降为正
+        if v_vertical > 0.1:
+            glide_ratio_current = v_horizontal / v_vertical
+        else:
+            glide_ratio_current = self.glide_ratio_natural
+
+        # 计算到达目标所需的滑翔比
+        if altitude_diff > 5.0:  # 需要下降至少5米
+            glide_ratio_required = horizontal_distance / altitude_diff
+        else:
+            # 已经接近目标高度，使用自然滑翔比
+            glide_ratio_required = self.glide_ratio_natural
+
+        # 应用余量系数 (更保守的下降)
+        glide_ratio_target = glide_ratio_required / self.descent_margin
+
+        # 计算需要的对称偏转量
+        # 滑翔比从 glide_ratio_natural (d_s=0) 到 glide_ratio_min (d_s=max)
+        # 线性映射: d_s = (glide_ratio_natural - glide_ratio_target) / (glide_ratio_natural - glide_ratio_min) * max_deflection
+
+        if glide_ratio_target >= self.glide_ratio_natural:
+            # 当前滑翔比已经够用或过低，不需要拉绳
+            delta_s = 0.0
+        elif glide_ratio_target <= self.glide_ratio_min:
+            # 需要最大下降率
+            delta_s = self.max_deflection
+        else:
+            # 线性插值
+            ratio = (self.glide_ratio_natural - glide_ratio_target) / \
+                    (self.glide_ratio_natural - self.glide_ratio_min)
+            delta_s = ratio * self.max_deflection
+
+        # 增加基于当前滑翔比误差的反馈控制
+        glide_error = glide_ratio_current - glide_ratio_target
+        delta_s_feedback = self.descent_kp * glide_error * 0.1  # 缩放系数
+
+        delta_s = np.clip(delta_s + delta_s_feedback, 0, self.max_deflection)
+
+        return delta_s, glide_ratio_required, glide_ratio_current
     
     def _find_closest_point(self, current_pos: np.ndarray) -> int:
         """
@@ -603,21 +776,38 @@ class ParafoilADRCController:
         # ========== 1. 找到轨迹上的参考点 ==========
         self.current_index = self._find_closest_point(current_pos)
         closest_point = self.trajectory[self.current_index]
-        lookahead_point = self._find_lookahead_point(current_pos, self.current_index)
         
-        if lookahead_point is None:
-            lookahead_point = closest_point
+        # 计算横向误差（用于判断是否需要优先回到轨迹）
+        ref_dir_temp = np.array([np.cos(closest_point.heading), np.sin(closest_point.heading)])
+        to_vehicle_temp = current_pos[:2] - closest_point.position[:2]
+        cross_track_error_temp = ref_dir_temp[0] * to_vehicle_temp[1] - ref_dir_temp[1] * to_vehicle_temp[0]
         
-        target_pos = lookahead_point.position
-        target_heading = lookahead_point.heading
+        # 如果横向误差过大（>50m），优先回到轨迹，使用最近点而非前视点
+        if abs(cross_track_error_temp) > 50.0:
+            # 使用最近点，直接指向轨迹
+            target_pos = closest_point.position
+            target_heading = closest_point.heading
+        else:
+            # 正常情况：使用前视点
+            lookahead_point = self._find_lookahead_point(current_pos, self.current_index)
+            if lookahead_point is None:
+                lookahead_point = closest_point
+            target_pos = lookahead_point.position
+            target_heading = lookahead_point.heading
         
         output.ref_position = target_pos.copy()
         output.ref_heading = target_heading
         
         # ========== 2. 计算跟踪误差 ==========
-        # 2.1 航向误差
-        heading_error = self._wrap_angle(target_heading - current_heading)
+        # 2.1 航向误差 (处理 ±π 跳变，选择最短路径)
+        raw_heading_error = target_heading - current_heading
+        heading_error = self._wrap_angle(raw_heading_error)
         output.heading_error = heading_error
+        
+        # 检查航向误差是否过大（可能导致控制器饱和）
+        if abs(heading_error) > np.radians(90):
+            # 如果误差超过90度，可能需要检查控制方向
+            pass
         
         # 2.2 高度误差
         output.altitude_error = closest_point.position[2] - current_pos[2]
@@ -637,56 +827,184 @@ class ParafoilADRCController:
         
         # ========== 3. 航向控制 (ADRC + 横向误差补偿) ==========
         # 根据横向误差调整目标航向
-        heading_correction = self.lateral_kp * cross_track_error
-        heading_correction = np.clip(heading_correction, -0.5, 0.5)
+        # 横向误差为正：在轨迹右侧，需要左转（减小航向）
+        # 横向误差为负：在轨迹左侧，需要右转（增大航向）
+        
+        # 限制横向误差的影响范围，避免过度修正
+        # 当横向误差很大时，使用饱和函数而非线性增益
+        max_cross_track = 100.0  # 最大有效横向误差 (m)
+        normalized_cross_track = np.clip(cross_track_error / max_cross_track, -1.0, 1.0)
+        
+        # 使用饱和函数，避免大误差时的过度修正
+        heading_correction = self.lateral_kp * max_cross_track * normalized_cross_track
+        heading_correction = np.clip(heading_correction, -np.radians(30), np.radians(30))  # 限制在30度以内
         
         adjusted_heading_ref = target_heading - heading_correction  # 负号:右偏需左转
         
-        # ADRC航向控制
+        # 如果航向误差过大，先限制调整后的目标航向，避免控制器饱和
+        # 当误差超过45度时，逐步调整目标航向（更激进的限制）
+        adjusted_error = self._wrap_angle(adjusted_heading_ref - current_heading)
+        if abs(adjusted_error) > np.radians(45):
+            # 限制调整速度：每次最多调整45度
+            max_adjustment = np.radians(45)
+            adjusted_heading_ref = current_heading + np.sign(adjusted_error) * max_adjustment
+        
+        # 归一化调整后的目标航向到 [-π, π]
+        adjusted_heading_ref = self._wrap_angle(adjusted_heading_ref)
+        
+        # ADRC航向控制（确保输入都在 [-π, π] 范围内）
         delta_diff = self.heading_adrc.update(adjusted_heading_ref, current_heading, self.dt)
         
         # ========== 4. 转换为左右操纵绳偏转 ==========
-        # delta_diff > 0 表示需要右转
-        delta_base = 0.0  # 可用于下降率控制
-        
-        delta_left = delta_base - delta_diff / 2
-        delta_right = delta_base + delta_diff / 2
-        
+        # delta_diff: ADRC输出，范围 [-max_deflection, max_deflection]
+        # delta_diff > 0: 需要右转 → 拉右绳
+        # delta_diff < 0: 需要左转 → 拉左绳
+        # delta_diff = 0: 直飞 → 两绳都不拉
+
+        # 翼伞控制逻辑:
+        # - 对称偏转 d_s = min(left, right): 控制下降率
+        # - 非对称偏转 d_a = left - right: 控制航向
+
+        # 保存非对称偏转量
+        output.delta_asymmetric = delta_diff
+
+        # 非对称控制：只拉一侧（暂不考虑对称偏转）
+        # 右转时: delta_right = delta_diff (正值), delta_left = 0
+        # 左转时: delta_left = -delta_diff (正值), delta_right = 0
+        # 直飞时: delta_left = delta_right = 0
+
+        if delta_diff > 0:
+            # 右转：只拉右绳
+            delta_right_heading = delta_diff
+            delta_left_heading = 0.0
+        elif delta_diff < 0:
+            # 左转：只拉左绳
+            delta_left_heading = -delta_diff  # delta_diff是负值，所以用减号
+            delta_right_heading = 0.0
+        else:
+            # 直飞：两绳都不拉
+            delta_left_heading = 0.0
+            delta_right_heading = 0.0
+
+        # 合成最终偏转量
+        # 对称偏转加到两侧（通过update方法设置，这里先设为0）
+        # 实际的对称偏转在update方法中计算
+        delta_left = delta_left_heading
+        delta_right = delta_right_heading
+
         # 限幅到 [0, max_deflection]
         delta_left = np.clip(delta_left, 0, self.max_deflection)
         delta_right = np.clip(delta_right, 0, self.max_deflection)
-        
+
         output.delta_left = delta_left
         output.delta_right = delta_right
         
+        # 调试输出
+        if self.debug and self.debug_counter % 100 == 0:  # 每100步打印一次
+            print(f"[控制器调试] step={self.debug_counter}")
+            print(f"  当前位置: ({current_pos[0]:.1f}, {current_pos[1]:.1f}, {current_pos[2]:.1f})")
+            print(f"  当前航向: {np.degrees(current_heading):.1f}°")
+            print(f"  目标航向: {np.degrees(target_heading):.1f}°")
+            print(f"  航向误差: {np.degrees(heading_error):.1f}°")
+            print(f"  横向误差: {cross_track_error:.2f}m (修正: {np.degrees(heading_correction):.2f}°)")
+            print(f"  调整后目标航向: {np.degrees(adjusted_heading_ref):.1f}°")
+            print(f"  调整后航向误差: {np.degrees(self._wrap_angle(adjusted_heading_ref - current_heading)):.1f}°")
+            print(f"  ADRC输出: {delta_diff:.3f} (范围: [-{self.max_deflection:.1f}, {self.max_deflection:.1f}])")
+            print(f"  左绳: {delta_left:.3f}, 右绳: {delta_right:.3f}")
+            if abs(delta_diff) >= self.max_deflection * 0.95:
+                print(f"  [警告] ADRC输出饱和! 航向误差: {np.degrees(heading_error):.1f}°")
+                # 检查ADRC内部状态
+                if hasattr(self.heading_adrc, 'td') and hasattr(self.heading_adrc, 'eso'):
+                    td_v1, td_v2 = self.heading_adrc.td.v1, self.heading_adrc.td.v2
+                    eso_z = self.heading_adrc.eso.z
+                    print(f"    TD输出: v1={np.degrees(td_v1):.1f}°, v2={np.degrees(td_v2):.1f}°/s")
+                    print(f"    ESO状态: z1={np.degrees(eso_z[0]):.1f}°, z2={np.degrees(eso_z[1]):.1f}°/s, z3={eso_z[2]:.3f}")
+        
+        self.debug_counter += 1
+        
         return output
     
-    def update(self, 
+    def update(self,
                current_pos: np.ndarray,
                current_vel: np.ndarray,
                current_heading: float,
                t: float = None) -> ControlOutput:
         """
         轨迹跟踪更新 (主接口)
-        
+
         参数:
             current_pos: 当前位置 [x, y, z]
             current_vel: 当前速度 [vx, vy, vz]
             current_heading: 当前航向 (rad)
             t: 当前时间 (可选，用于基于时间的跟踪)
-        
+
         返回:
             ControlOutput: 控制输出
         """
         # 计算航向角速度 (如果有速度信息)
         current_speed = np.linalg.norm(current_vel[:2])
         heading_rate = 0.0
-        
-        return self.compute_control(
+
+        # 1. 计算航向控制 (非对称偏转)
+        output = self.compute_control(
             current_pos=current_pos,
             current_heading=current_heading,
             current_heading_rate=heading_rate
         )
+
+        # 2. 计算下降率控制 (对称偏转)
+        delta_s, glide_required, glide_current = self.compute_symmetric_deflection(
+            current_pos=current_pos,
+            current_vel=current_vel
+        )
+
+        output.delta_symmetric = delta_s
+        output.glide_ratio_required = glide_required
+        output.glide_ratio_current = glide_current
+
+        # 3. 合成最终控制量
+        # 对称偏转 d_s = min(left, right): 控制下降率
+        # 非对称偏转 d_a = left - right: 控制航向
+        # 
+        # 关键：优先保证航向控制！
+        # 对称偏转需要让出空间给非对称偏转
+
+        delta_a = output.delta_asymmetric  # 航向控制的非对称分量
+        delta_a_abs = abs(delta_a)
+
+        # 限制对称偏转，为非对称偏转留出空间
+        # max_deflection = d_s + |d_a|，所以 d_s <= max_deflection - |d_a|
+        max_symmetric = self.max_deflection - delta_a_abs
+        delta_s_limited = np.clip(delta_s, 0, max(0, max_symmetric))
+
+        # 更新实际使用的对称偏转量
+        output.delta_symmetric = delta_s_limited
+
+        if delta_a >= 0:
+            # 右转或直飞: d_a >= 0
+            # 右绳拉更多
+            delta_left = delta_s_limited
+            delta_right = delta_s_limited + delta_a
+        else:
+            # 左转: d_a < 0
+            # 左绳拉更多
+            delta_left = delta_s_limited - delta_a  # delta_a是负的，所以用减号
+            delta_right = delta_s_limited
+
+        # 限幅（理论上不会超出，但保险起见）
+        delta_left = np.clip(delta_left, 0, self.max_deflection)
+        delta_right = np.clip(delta_right, 0, self.max_deflection)
+
+        output.delta_left = delta_left
+        output.delta_right = delta_right
+
+        # 调试输出
+        if self.debug and self.debug_counter % 100 == 1:  # 刚打印完航向信息后
+            print(f"  [下降率控制] d_s_请求={delta_s:.3f}, d_s_实际={delta_s_limited:.3f}")
+            print(f"    所需滑翔比: {glide_required:.1f}, 当前: {glide_current:.1f}")
+            print(f"    d_a={delta_a:.3f}, 最终: L={delta_left:.3f}, R={delta_right:.3f}")
+
+        return output
     
     def is_finished(self, current_pos: np.ndarray, threshold: float = 20.0) -> bool:
         """
