@@ -31,7 +31,7 @@ target:
   z: 0
   radius: 20           # 着陆区半径 (m)
   approach_heading: 45 # 进场航向 (deg)
-  approach_length: 80  # 进场直线段长度 (m)，缩短以获得更好的入场规划
+  approach_length: 150  # 进场直线段长度 (m)，确保进场段保持合理的滑翔比
   # 随机化参数 (randomization.enabled=true时生效)
   random:
     x_range: [1200, 1800]   # x随机范围
