@@ -147,12 +147,24 @@ class PathSmoother:
         # Step 5: 生成轨迹点
         trajectory_points = []
         
-        # 如果提供了map_manager，确保基础轨迹最后高度不低于进场点高度
+        # 确定最小高度约束
+        # 如果提供了map_manager，使用进场高度
+        # 否则，使用航点中最后20%的最低高度（用于画圆入口）
         min_end_altitude = None
         if map_manager is not None and map_manager.target is not None:
             min_end_altitude = map_manager.target.get_approach_point(
                 map_manager.constraints.terminal_altitude
             )[2]
+        elif len(dense_waypoints) > 5:
+            # 没有map_manager时，检查航点末端是否有画圆（高度基本恒定）
+            # 使用最后20%航点的最低高度作为约束
+            last_20_percent = dense_waypoints[int(len(dense_waypoints) * 0.8):]
+            z_values = [wp[2] for wp in last_20_percent]
+            min_z = min(z_values)
+            max_z = max(z_values)
+            # 如果最后20%的高度变化小于5m，说明是画圆或进场段，使用最低高度作为约束
+            if max_z - min_z < 10.0:
+                min_end_altitude = min_z
 
         for i in range(n_samples + 1):
             t = i * self.dt

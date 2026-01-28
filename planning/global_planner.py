@@ -458,11 +458,11 @@ class RRTStarPlanner:
                 theta_start = theta_end + total_angle
                 tangent_sign = -1.0
             
-            # 画圆入口点
+            # 画圆入口点（loiter_center已经在正确高度，z方向偏移为0）
             loiter_entry = loiter_center + np.array([
                 loiter_radius * np.cos(theta_start),
                 loiter_radius * np.sin(theta_start),
-                loiter_altitude
+                0.0  # z方向偏移为0
             ])
             
             # RRT*的目标是画圆入口点
@@ -476,12 +476,63 @@ class RRTStarPlanner:
         
         # ======== Step 3: RRT*规划到画圆入口 ========
         print(f"    [规划] RRT*目标: {'画圆入口点' if loiter_loops > 0 else '进场点'} (高度{rrt_goal[2]:.1f}m)")
-        
+
         # 不添加最终目标，因为后面会手动添加画圆和进场航点
         path_to_entry, info = self.plan(start=start, goal=rrt_goal, max_time=max_time, add_final_target=False)
-        
+
         if path_to_entry is None:
             return None, info
+
+        # ======== Step 3.5: 检查并修复RRT*路径末端到画圆高度的平滑过渡 ========
+        # 问题：RRT*可能在距离目标较远处连接，导致多个点低于画圆高度，造成突然跳升
+        # 解决：从后往前找到所有低于画圆高度的点，从第一个高点开始平滑下降
+        if loiter_loops > 0 and len(path_to_entry) >= 2:
+            print(f"    [调试] 画圆高度={loiter_altitude:.1f}m")
+            print(f"    [调试] RRT*路径最后5个点的高度: ", end="")
+            for i in range(max(0, len(path_to_entry)-5), len(path_to_entry)):
+                print(f"[{i}]={path_to_entry[i][2]:.1f}m ", end="")
+            print()
+
+            # 从后往前扫描，找到第一个高度>=画圆高度的点
+            split_idx = -1
+            for i in range(len(path_to_entry) - 1, -1, -1):
+                if path_to_entry[i][2] >= loiter_altitude:
+                    split_idx = i
+                    break
+
+            if split_idx == -1:
+                # 所有点都低于画圆高度，这不应该发生（起点应该更高）
+                print(f"    [警告] RRT*路径所有点都低于画圆高度，强制最后一个点为画圆高度")
+                path_to_entry[-1] = path_to_entry[-1].copy()
+                path_to_entry[-1][2] = loiter_altitude
+            elif split_idx == len(path_to_entry) - 1:
+                # 最后一个点已经>=画圆高度，无需调整
+                print(f"    [调试] 最后一个点高度已>=画圆高度，无需调整")
+            else:
+                # 有点低于画圆高度，需要调整
+                n_low_points = len(path_to_entry) - 1 - split_idx
+                start_point = path_to_entry[split_idx].copy()
+                end_point = path_to_entry[-1].copy()  # 画圆入口点
+
+                print(f"    [调试] 发现{n_low_points}个点低于画圆高度")
+                print(f"    [调试] 从点[{split_idx}](高度{start_point[2]:.1f}m)到点[{len(path_to_entry)-1}](高度{end_point[2]:.1f}m)")
+
+                # 移除split_idx之后的所有点（包括画圆入口点）
+                path_to_entry = path_to_entry[:split_idx+1]
+
+                # 插入平滑过渡点：从start_point平滑下降到loiter_altitude
+                horizontal_dist = np.linalg.norm(end_point[:2] - start_point[:2])
+                n_transition = max(int(horizontal_dist / 10), n_low_points + 2)  # 至少和原来一样多，每10m至少1个点
+
+                for i in range(1, n_transition + 1):
+                    alpha = i / n_transition
+                    # 水平位置线性插值
+                    new_pt = start_point + alpha * (end_point - start_point)
+                    # 高度从start_point[2]线性下降到loiter_altitude
+                    new_pt[2] = start_point[2] + alpha * (loiter_altitude - start_point[2])
+                    path_to_entry.append(new_pt)
+
+                print(f"    [规划] 插入{n_transition}个过渡点，从{start_point[2]:.1f}m平滑下降到{loiter_altitude:.1f}m")
         
         # ======== Step 4: 生成画圆航点 ========
         loiter_waypoints = []
@@ -494,7 +545,7 @@ class RRTStarPlanner:
                 wp = loiter_center + np.array([
                     loiter_radius * np.cos(theta),
                     loiter_radius * np.sin(theta),
-                    loiter_altitude
+                    0.0  # z方向偏移为0，loiter_center已经在正确高度
                 ])
                 loiter_waypoints.append(wp)
             
