@@ -523,8 +523,8 @@ class ParafoilADRCController:
                  lateral_kp: float = 0.01,
                  lateral_kd: float = 0.005,
                  # 下降率控制参数
-                 glide_ratio_natural: float = 11.0,   # 自然滑翔比 (无对称偏转)
-                 glide_ratio_min: float = 5.0,        # 最小滑翔比 (最大对称偏转)
+                 glide_ratio_natural: float = 6.48,   # 自然滑翔比 (无对称偏转)
+                 glide_ratio_min: float = 2.47,       # 最小滑翔比 (最大对称偏转)
                  descent_kp: float = 0.5,             # 下降率控制增益
                  descent_margin: float = 1.2,         # 滑翔比余量系数
                  # 系统参数

@@ -166,8 +166,8 @@ class ClosedLoopSimulator:
             heading_eso_omega=3.0,    # 低：减少噪声和过度补偿
             heading_td_r=10.0,        # 低：平滑的参考过渡
             lateral_kp=0.002,         # 低：避免横向误差过度修正
-            glide_ratio_natural=11.0, # 自然滑翔比 (无对称偏转)
-            glide_ratio_min=5.0,      # 最小滑翔比 (最大对称偏转)
+            glide_ratio_natural=6.48, # 自然滑翔比 (无对称偏转)
+            glide_ratio_min=2.47,     # 最小滑翔比 (最大对称偏转)
             descent_kp=0.5,           # 下降率控制增益
             descent_margin=1.2,       # 滑翔比余量系数
             reference_speed=reference_speed,

@@ -29,9 +29,11 @@ target:
   x: 1500
   y: 800
   z: 0
-  radius: 20           # 着陆区半径 (m)
-  approach_heading: 45 # 进场航向 (deg)
-  approach_length: 150  # 进场直线段长度 (m)，确保进场段保持合理的滑翔比
+  radius: 20                      # 着陆区半径 (m)
+  desired_approach_heading: 45    # 期望进场航向 (deg)，规划器会动态调整以避开障碍物
+  max_approach_length: 150        # 最大进场直线段长度 (m)，会自动搜索最长的安全进场段
+  min_approach_length: 50         # 最小进场直线段长度 (m)
+  approach_heading_tolerance: 90  # 航向调整容差 (deg)，允许±90度范围内搜索
   # 随机化参数 (randomization.enabled=true时生效)
   random:
     x_range: [1200, 1800]   # x随机范围
@@ -136,7 +138,8 @@ constraints:
   min_altitude: 20           # 最低飞行高度
   terminal_altitude: 50      # 进场高度
   safety_margin: 15
-  glide_ratio: 6.5           # 滑翔比 (从开环测试得到)
+  glide_ratio: 6.48          # 最大滑翔比 (不拉绳)
+  min_glide_ratio: 2.47      # 最小滑翔比 (左右拉满)
   altitude_margin: 50        # 高度余量 (m)，用于路径绕行和消高
 
 # ---------- 轨迹参数 ----------
