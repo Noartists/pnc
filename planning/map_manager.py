@@ -228,19 +228,32 @@ class Waypoint:
 @dataclass
 class LandingTarget:
     """着陆目标"""
-    position: np.ndarray           # [x, y, z]
-    radius: float                  # 着陆区半径
-    approach_heading: float        # 进场航向 (rad)
-    approach_length: float         # 进场直线段长度
+    position: np.ndarray                # [x, y, z]
+    radius: float                       # 着陆区半径
+    desired_approach_heading: float     # 期望进场航向 (rad)
+    max_approach_length: float          # 最大进场直线段长度 (m)
+    min_approach_length: float = 50.0  # 最小进场直线段长度 (m)
+    approach_heading_tolerance: float = np.pi / 2  # 航向调整容差 (rad)，默认±90°
+
+    # 为了兼容性，保留旧的字段名作为属性
+    @property
+    def approach_heading(self) -> float:
+        """兼容性：返回期望进场航向"""
+        return self.desired_approach_heading
+
+    @property
+    def approach_length(self) -> float:
+        """兼容性：返回最大进场长度"""
+        return self.max_approach_length
 
     def get_approach_point(self, terminal_altitude: float = 80) -> np.ndarray:
-        """获取进场点位置
-        
+        """获取进场点位置（基于期望参数，实际使用时应调用 MapManager.find_safe_approach_point）
+
         参数:
             terminal_altitude: 进场点高度 (m)，默认80m
         """
-        dx = -self.approach_length * np.cos(self.approach_heading)
-        dy = -self.approach_length * np.sin(self.approach_heading)
+        dx = -self.max_approach_length * np.cos(self.desired_approach_heading)
+        dy = -self.max_approach_length * np.sin(self.desired_approach_heading)
         return self.position + np.array([dx, dy, terminal_altitude])
 
 
@@ -252,8 +265,9 @@ class Constraints:
     min_altitude: float = 30
     terminal_altitude: float = 100
     safety_margin: float = 20
-    glide_ratio: float = 6.5       # 滑翔比 (水平距离/下降高度)
-    altitude_margin: float = 50    # 高度余量 (m)，用于路径绕行和消高
+    glide_ratio: float = 6.48          # 最大滑翔比 (不拉绳)
+    min_glide_ratio: float = 2.47      # 最小滑翔比 (左右拉满)
+    altitude_margin: float = 50        # 高度余量 (m)，用于路径绕行和消高
 
 
 # ============================================================
@@ -297,11 +311,19 @@ class MapManager:
         # 目标
         if 'target' in cfg:
             t = cfg['target']
+            # 兼容旧配置：如果使用旧字段名，自动转换
+            desired_heading = t.get('desired_approach_heading', t.get('approach_heading', 45))
+            max_length = t.get('max_approach_length', t.get('approach_length', 150))
+            min_length = t.get('min_approach_length', 50)
+            heading_tolerance = t.get('approach_heading_tolerance', 90)
+
             manager.target = LandingTarget(
                 position=np.array([t['x'], t['y'], t['z']]),
                 radius=t['radius'],
-                approach_heading=np.radians(t['approach_heading']),
-                approach_length=t['approach_length']
+                desired_approach_heading=np.radians(desired_heading),
+                max_approach_length=max_length,
+                min_approach_length=min_length,
+                approach_heading_tolerance=np.radians(heading_tolerance)
             )
 
         # 禁飞区
@@ -326,7 +348,8 @@ class MapManager:
                 min_altitude=c.get('min_altitude', 30),
                 terminal_altitude=c.get('terminal_altitude', 100),
                 safety_margin=c.get('safety_margin', 20),
-                glide_ratio=c.get('glide_ratio', 6.5),
+                glide_ratio=c.get('glide_ratio', 6.48),
+                min_glide_ratio=c.get('min_glide_ratio', 2.47),
                 altitude_margin=c.get('altitude_margin', 50)
             )
 
@@ -377,12 +400,20 @@ class MapManager:
             target_x = np.random.uniform(*r['x_range'])
             target_y = np.random.uniform(*r['y_range'])
             target_z = r.get('z', 0)  # 地面高度固定
-            approach_heading = np.random.uniform(0, 2 * np.pi)
+            desired_heading = np.random.uniform(0, 2 * np.pi)
+
+            # 兼容新旧配置格式
+            max_length = t.get('max_approach_length', t.get('approach_length', 200))
+            min_length = t.get('min_approach_length', 50)
+            heading_tolerance = t.get('approach_heading_tolerance', 90)
+
             self.target = LandingTarget(
                 position=np.array([target_x, target_y, target_z]),
                 radius=t.get('radius', 20),
-                approach_heading=approach_heading,
-                approach_length=t.get('approach_length', 200)
+                desired_approach_heading=desired_heading,
+                max_approach_length=max_length,
+                min_approach_length=min_length,
+                approach_heading_tolerance=np.radians(heading_tolerance)
             )
             print(f"随机终点: ({target_x:.0f}, {target_y:.0f}, {target_z:.0f})")
         elif self.target is not None:
@@ -802,6 +833,145 @@ class MapManager:
         if self.corridor is None:
             return np.inf
         return -self.corridor.distance(point)  # 取反，在内部为正
+
+    # -------- 进场点搜索 --------
+
+    def is_in_bounds(self, point: np.ndarray) -> bool:
+        """检查点是否在地图边界内（已有_in_bounds，此为公开接口）"""
+        return self._in_bounds(point)
+
+    def is_safe_approach(self, approach_point: np.ndarray, target_pos: np.ndarray) -> bool:
+        """
+        检查进场点及进场路径是否安全
+
+        参数:
+            approach_point: 进场点 [x, y, z]
+            target_pos: 目标点 [x, y, z]
+
+        返回:
+            True 如果安全，False 否则
+        """
+        # 1. 进场点在地图边界内
+        if not self._in_bounds(approach_point):
+            return False
+
+        # 2. 进场点在空域走廊内
+        if not self._in_corridor(approach_point):
+            return False
+
+        # 3. 进场点无碰撞
+        if self.is_collision(approach_point):
+            return False
+
+        # 4. 进场直线段无碰撞
+        if self.is_path_collision(approach_point, target_pos):
+            return False
+
+        return True
+
+    def find_safe_approach_point(self,
+                                 target_pos: np.ndarray,
+                                 altitude: float,
+                                 desired_heading: Optional[float] = None,
+                                 max_length: Optional[float] = None,
+                                 min_length: Optional[float] = None,
+                                 heading_tolerance: Optional[float] = None) -> Tuple[Optional[np.ndarray], float, float]:
+        """
+        动态查找安全的进场点
+
+        策略：
+        1. 沿期望航向从短到长采样不同长度的进场段
+        2. 如果都不安全，尝试调整航向（±30°、±60°等）
+        3. 返回找到的最长的安全进场段
+
+        参数:
+            target_pos: 目标位置 [x, y, z]
+            altitude: 进场点高度
+            desired_heading: 期望进场航向 (rad)，None则使用target配置
+            max_length: 最大进场长度，None则使用target配置
+            min_length: 最小进场长度，None则使用target配置
+            heading_tolerance: 航向调整容差 (rad)，None则使用target配置
+
+        返回:
+            (approach_point, actual_heading, actual_length) 或 (None, 0, 0)
+        """
+        if self.target is None:
+            print("    [警告] 未定义目标，无法查找进场点")
+            return None, 0.0, 0.0
+
+        # 使用target配置作为默认值
+        if desired_heading is None:
+            desired_heading = self.target.desired_approach_heading
+        if max_length is None:
+            max_length = self.target.max_approach_length
+        if min_length is None:
+            min_length = self.target.min_approach_length
+        if heading_tolerance is None:
+            heading_tolerance = self.target.approach_heading_tolerance
+
+        print(f"    [进场点搜索] 期望航向={np.degrees(desired_heading):.1f}°, "
+              f"长度范围=[{min_length:.0f}, {max_length:.0f}]m, "
+              f"容差=±{np.degrees(heading_tolerance):.1f}°")
+
+        # 定义采样长度序列（从长到短，优先选择长的）
+        length_samples = []
+        step = 25  # 每25m采样一个长度
+        current_length = max_length
+        while current_length >= min_length:
+            length_samples.append(current_length)
+            current_length -= step
+        # 确保包含最小长度
+        if min_length not in length_samples:
+            length_samples.append(min_length)
+
+        # 定义航向偏移序列（从0开始，逐渐增大偏移）
+        heading_offsets = [0]  # 首先尝试期望航向
+        for offset_deg in [15, 30, 45, 60, 75, 90]:
+            offset_rad = np.radians(offset_deg)
+            if offset_rad <= heading_tolerance:
+                heading_offsets.extend([offset_rad, -offset_rad])
+
+        # 搜索安全的进场点
+        best_approach = None
+        best_heading = 0.0
+        best_length = 0.0
+
+        for heading_offset in heading_offsets:
+            test_heading = desired_heading + heading_offset
+
+            for length in length_samples:
+                # 计算候选进场点
+                dx = -length * np.cos(test_heading)
+                dy = -length * np.sin(test_heading)
+                candidate = target_pos.copy()
+                candidate[0] += dx
+                candidate[1] += dy
+                candidate[2] = altitude
+
+                # 检查是否安全
+                if self.is_safe_approach(candidate, target_pos):
+                    # 找到安全点，如果比当前最佳更长，则更新
+                    if length > best_length:
+                        best_approach = candidate
+                        best_heading = test_heading
+                        best_length = length
+                        print(f"    [进场点搜索] 找到安全进场点: "
+                              f"航向={np.degrees(test_heading):.1f}° (偏移{np.degrees(heading_offset):.1f}°), "
+                              f"长度={length:.0f}m")
+                    # 由于从长到短搜索，找到就可以跳过后续更短的
+                    break
+
+            # 如果在当前航向找到了最大长度，直接返回（最优解）
+            if best_length == max_length:
+                break
+
+        if best_approach is not None:
+            print(f"    [进场点搜索] ✓ 最终选择: "
+                  f"航向={np.degrees(best_heading):.1f}°, 长度={best_length:.0f}m")
+            return best_approach, best_heading, best_length
+        else:
+            print(f"    [进场点搜索] ✗ 未找到安全进场点！")
+            return None, 0.0, 0.0
 
     # -------- 可视化数据 --------
 

@@ -148,6 +148,12 @@ class RRTStarPlanner:
                 if pbar is not None:
                     pbar.update(1)
                 continue
+            
+            # 滑翔比约束检测（关键！翼伞是欠驱动系统）
+            if not self._is_glide_feasible(nearest.position, new_pos):
+                if pbar is not None:
+                    pbar.update(1)
+                continue
 
             # 在搜索半径内找近邻节点
             near_indices = self._near_nodes(new_pos)
@@ -159,9 +165,11 @@ class RRTStarPlanner:
             for idx in near_indices:
                 node = self.nodes[idx]
                 cost = node.cost + self._cost(node.position, new_pos)
+                # 检查碰撞和滑翔比约束
                 if cost < min_cost and not self.map.is_path_collision(node.position, new_pos):
-                    min_cost = cost
-                    best_parent = idx
+                    if self._is_glide_feasible(node.position, new_pos):
+                        min_cost = cost
+                        best_parent = idx
 
             # 添加新节点
             new_node = RRTNode(new_pos, best_parent, min_cost)
@@ -306,6 +314,47 @@ class RRTStarPlanner:
         new_pos[2] = max(new_pos[2], self.min_altitude)
 
         return new_pos
+    
+    def _is_glide_feasible(self, from_pos: np.ndarray, to_pos: np.ndarray, 
+                           tolerance: float = 1.2) -> bool:
+        """
+        检查两点之间是否满足滑翔比可达性约束
+        
+        只检查最大滑翔比约束（可达性）：
+        - 滑翔比 > 最大值: 不可达，飞不到
+        - 滑翔比 < 最小值: 高度富余，通过画圆消高解决（不是不可行！）
+        
+        参数:
+            from_pos: 起点 [x, y, z]
+            to_pos: 终点 [x, y, z]
+            tolerance: 容差系数
+        
+        返回:
+            bool: 是否可达
+        """
+        dz = from_pos[2] - to_pos[2]  # 高度下降（正值）
+        dxy = np.linalg.norm(to_pos[:2] - from_pos[:2])  # 水平距离
+        
+        # 如果高度几乎不变或爬升
+        if dz <= 0.5:
+            # 允许短距离水平飞行（利用动能）
+            if dxy < 30.0:
+                return True
+            # 大范围水平飞行不可达
+            return False
+        
+        # 计算实际滑翔比
+        actual_glide = dxy / dz
+        
+        # 只检查最大滑翔比（可达性）
+        max_glide = self.map.constraints.glide_ratio  # ~6.48
+        
+        # 如果滑翔比太大，不可达
+        if actual_glide > max_glide * tolerance:
+            return False
+        
+        # 滑翔比小没关系，高度富余可以画圆消高
+        return True
 
     def _distance(self, p1: np.ndarray, p2: np.ndarray) -> float:
         """计算两点距离 (考虑垂直方向权重)"""
@@ -326,9 +375,11 @@ class RRTStarPlanner:
             new_cost = new_node.cost + self._cost(new_node.position, node.position)
 
             if new_cost < node.cost:
+                # 检查碰撞和滑翔比约束
                 if not self.map.is_path_collision(new_node.position, node.position):
-                    node.parent = new_idx
-                    node.cost = new_cost
+                    if self._is_glide_feasible(new_node.position, node.position):
+                        node.parent = new_idx
+                        node.cost = new_cost
 
     def _extract_path(self, add_final_target: bool = True) -> List[np.ndarray]:
         """从目标回溯提取路径
@@ -382,72 +433,224 @@ class RRTStarPlanner:
         approach_heading = target.approach_heading
         approach_length = target.approach_length
         terminal_altitude = constraints.terminal_altitude
-        glide_ratio = constraints.glide_ratio
+        glide_ratio = constraints.glide_ratio  # 最大滑翔比
+        min_glide_ratio = constraints.min_glide_ratio  # 最小滑翔比
         altitude_margin = constraints.altitude_margin
         min_turn_radius = constraints.min_turn_radius
-        
-        # ======== Step 1: 计算画圆参数 ========
-        # 计算需要的额外水平距离
+
+        # ======== Step 0: 快速滑翔比判断 ========
+        horizontal_dist = np.linalg.norm(start[:2] - target_pos[:2])
+        altitude_diff = start[2] - target_pos[2]
+
+        if altitude_diff <= 0:
+            print(f"    [规划] 起点高度({start[2]:.1f}m) <= 终点高度({target_pos[2]:.1f}m)，无法到达！")
+            return None, {'success': False, 'error': 'Start altitude too low'}
+
+        direct_glide_ratio = horizontal_dist / altitude_diff
+
+        print(f"\n    [快速判断] 起点到终点:")
+        print(f"      水平距离: {horizontal_dist:.1f}m, 高度差: {altitude_diff:.1f}m")
+        print(f"      直线滑翔比: {direct_glide_ratio:.2f}, 范围: [{min_glide_ratio:.2f}, {glide_ratio:.2f}]")
+
+        if direct_glide_ratio > glide_ratio:
+            print(f"    [规划] ✗ 终点不可达！滑翔比{direct_glide_ratio:.2f} > 最大{glide_ratio:.2f}")
+            return None, {'success': False, 'error': 'Target unreachable'}
+        elif direct_glide_ratio >= min_glide_ratio:
+            print(f"    [规划] ✓ 可以直飞，不需要画圆消高\n")
+            force_no_loiter = True
+        else:
+            print(f"    [规划] ⚠ 需要画圆消高（滑翔比{direct_glide_ratio:.2f} < 最小{min_glide_ratio:.2f})\n")
+            force_no_loiter = False
+
+        # ======== Step 1: 基于最大滑翔比约束计算画圆高度范围 ========
+        # 这些变量在后续步骤中会用到，所以先定义
         start_z = start[2]
         target_z = target_pos[2]
-        
-        # 基于滑翔比计算需要的最小水平距离
-        min_horizontal = (start_z - target_z - altitude_margin) * glide_ratio
-        
-        # 估算直线距离（起点到目标）
         direct_distance = np.linalg.norm(start[:2] - target_pos[:2])
-        
-        # 需要的额外距离（用于画圆消高）
-        extra_distance = max(0.0, min_horizontal - direct_distance)
-        
-        # 计算画圆参数
-        loiter_radius = 1.5 * min_turn_radius  # 使用1.5倍最小转弯半径
-        loiter_loops = 0
-        if extra_distance > 1e-3:
-            loiter_loops = int(np.ceil(extra_distance / (2 * np.pi * loiter_radius)))
-        
-        # ======== Step 2: 计算画圆位置和入口点 ========
-        # 画圆位置在进场点附近，高度为进场高度
-        loiter_altitude = terminal_altitude
-        
-        # 进场点（画圆出口 = 进场点）
-        approach_point = target_pos.copy()
-        approach_point[0] -= approach_length * np.cos(approach_heading)
-        approach_point[1] -= approach_length * np.sin(approach_heading)
-        approach_point[2] = loiter_altitude
-        
-        # 画圆中心（在进场点的侧面）
-        # CCW方向：中心在进场点的左侧
-        theta_center = approach_heading - np.pi / 2.0
-        loiter_center = approach_point.copy()
-        loiter_center[:2] -= loiter_radius * np.array([np.cos(theta_center), np.sin(theta_center)])
-        
-        # 检查画圆区域是否有碰撞
-        loiter_direction = "ccw"
-        if not self._circle_ok(loiter_center, loiter_radius, loiter_altitude):
-            # 尝试CW方向
-            theta_center = approach_heading + np.pi / 2.0
-            loiter_center = approach_point.copy()
-            loiter_center[:2] -= loiter_radius * np.array([np.cos(theta_center), np.sin(theta_center)])
-            loiter_direction = "cw"
-            
-            if not self._circle_ok(loiter_center, loiter_radius, loiter_altitude):
-                # 两个方向都不行，尝试更大的半径
+
+        if force_no_loiter:
+            # 跳过画圆计算
+            loiter_loops = 0
+            loiter_radius = min_turn_radius * 1.5
+            loiter_direction = None
+            loiter_altitude = terminal_altitude
+        else:
+            # 需要画圆，执行完整计算
+
+            # 关键约束：所有路径段的滑翔比都不能超过翼伞的最大滑翔比
+            # 约束1：进场段滑翔比 <= glide_ratio
+            # approach_length / (loiter_exit - target_z) <= glide_ratio
+            # => loiter_exit >= target_z + approach_length / glide_ratio
+            min_loiter_exit = target_z + approach_length / glide_ratio
+
+            # 约束2：起点到画圆入口段的滑翔比 <= glide_ratio
+            # 注意：RRT*会绕行避障，实际路径长度会比直线距离长
+            # 保守估计：实际路径 = 直线距离 × 1.5（50%绕行，更保守）
+            rrt_detour_factor = 1.5  # RRT*绕行系数（保守估计）
+            estimated_rrt_distance = (direct_distance - approach_length) * rrt_detour_factor
+
+            # estimated_rrt_distance / (start_z - loiter_entry) <= glide_ratio
+            # => loiter_entry <= start_z - estimated_rrt_distance / glide_ratio
+            max_loiter_entry = start_z - estimated_rrt_distance / glide_ratio
+
+            print(f"    [规划] 估算RRT*距离={estimated_rrt_distance:.0f}m (直线{direct_distance-approach_length:.0f}m × 绕行系数{rrt_detour_factor})")
+            print(f"    [规划] 满足滑翔比{glide_ratio:.1f}约束: 画圆入口高度<={max_loiter_entry:.1f}m")
+
+            # 画圆要消耗高度，所以 loiter_entry > loiter_exit
+            # 同时确保至少消耗一定的高度
+            min_altitude_loss = 20.0  # 画圆至少消耗20m高度
+
+            # 理论最优：在满足约束的前提下，尽量低（省距离）
+            optimal_loiter_exit = max(min_loiter_exit, self.min_altitude)
+            optimal_loiter_entry = min(max_loiter_entry, start_z - 10)
+
+            # 检查是否可行
+            if optimal_loiter_entry <= optimal_loiter_exit + min_altitude_loss:
+                # 不可行：即使在理论最优情况下，画圆也消耗不了足够的高度
+                # 说明直线距离太短，需要通过画圆补充距离
+                print(f"    [规划] 直线距离不足，需要画圆补充距离")
+                # 强制设定：画圆出口尽量低，入口尽量高
+                optimal_loiter_exit = max(min_loiter_exit, self.min_altitude)
+                optimal_loiter_entry = start_z - 10
+            else:
+                print(f"    [规划] 计算画圆高度范围: 入口<={optimal_loiter_entry:.1f}m, 出口>={optimal_loiter_exit:.1f}m")
+
+            # 使用入口高度作为搜索的目标（后面会调整出口高度）
+            optimal_loiter_altitude = optimal_loiter_entry
+            print(f"    [规划] 目标画圆入口高度={optimal_loiter_altitude:.1f}m (满足最大滑翔比{glide_ratio:.1f}约束)")
+
+            # ======== Step 2: 搜索可行的画圆高度（避障） ========
+            # 画圆中心的XY位置（固定，基于进场方向）
+            loiter_center_xy = target_pos[:2].copy()
+            loiter_center_xy[0] -= approach_length * np.cos(approach_heading)
+            loiter_center_xy[1] -= approach_length * np.sin(approach_heading)
+
+            # 画圆半径
+            loiter_radius = 1.5 * min_turn_radius
+
+            # 搜索可行的画圆高度：在 [terminal_altitude, start_z-10] 范围内
+            # 优先级：最接近 optimal_loiter_altitude 的高度
+            search_altitudes = []
+
+            # 以 optimal_loiter_altitude 为中心，向上下搜索
+            step = 10.0  # 每10m采样一个高度
+            for offset in np.arange(0, start_z - terminal_altitude, step):
+                # 向上搜索
+                if optimal_loiter_altitude + offset <= start_z - 10:
+                    search_altitudes.append(optimal_loiter_altitude + offset)
+                # 向下搜索
+                if optimal_loiter_altitude - offset >= terminal_altitude:
+                    search_altitudes.append(optimal_loiter_altitude - offset)
+
+            # 确保包含边界值
+            if terminal_altitude not in search_altitudes:
+                search_altitudes.append(terminal_altitude)
+
+            # 尝试找到可行的画圆高度和方向
+            loiter_altitude = None
+            loiter_direction = None
+            theta_center = None
+
+            for candidate_altitude in search_altitudes:
+                # 尝试CCW方向（逆时针）
+                theta_ccw = approach_heading - np.pi / 2.0
+                center_ccw = np.array([
+                    loiter_center_xy[0] - loiter_radius * np.cos(theta_ccw),
+                    loiter_center_xy[1] - loiter_radius * np.sin(theta_ccw),
+                    candidate_altitude
+                ])
+
+                if self._circle_ok(center_ccw, loiter_radius, candidate_altitude):
+                    loiter_altitude = candidate_altitude
+                    loiter_direction = "ccw"
+                    theta_center = theta_ccw
+                    loiter_center = center_ccw
+                    print(f"    [规划] 找到可行画圆高度={loiter_altitude:.1f}m (CCW方向)")
+                    break
+
+                # 尝试CW方向（顺时针）
+                theta_cw = approach_heading + np.pi / 2.0
+                center_cw = np.array([
+                    loiter_center_xy[0] - loiter_radius * np.cos(theta_cw),
+                    loiter_center_xy[1] - loiter_radius * np.sin(theta_cw),
+                    candidate_altitude
+                ])
+
+                if self._circle_ok(center_cw, loiter_radius, candidate_altitude):
+                    loiter_altitude = candidate_altitude
+                    loiter_direction = "cw"
+                    theta_center = theta_cw
+                    loiter_center = center_cw
+                    print(f"    [规划] 找到可行画圆高度={loiter_altitude:.1f}m (CW方向)")
+                    break
+
+            # 如果找不到可行高度，尝试更大的半径
+            if loiter_altitude is None:
+                print(f"    [警告] 标准半径({loiter_radius:.1f}m)无可行高度，尝试更大半径")
                 loiter_radius = 2.0 * min_turn_radius
-                loiter_loops = int(np.ceil(extra_distance / (2 * np.pi * loiter_radius))) if extra_distance > 1e-3 else 0
-                
-                theta_center = approach_heading - np.pi / 2.0
-                loiter_center = approach_point.copy()
-                loiter_center[:2] -= loiter_radius * np.array([np.cos(theta_center), np.sin(theta_center)])
-                loiter_direction = "ccw"
-                
-                if not self._circle_ok(loiter_center, loiter_radius, loiter_altitude):
-                    # 还是不行，跳过画圆
-                    loiter_loops = 0
-                    print(f"    [警告] 无法找到安全的画圆区域，跳过画圆消高")
-        
-        # 计算画圆入口点
+
+                for candidate_altitude in search_altitudes:
+                    theta_ccw = approach_heading - np.pi / 2.0
+                    center_ccw = np.array([
+                        loiter_center_xy[0] - loiter_radius * np.cos(theta_ccw),
+                        loiter_center_xy[1] - loiter_radius * np.sin(theta_ccw),
+                        candidate_altitude
+                    ])
+
+                    if self._circle_ok(center_ccw, loiter_radius, candidate_altitude):
+                        loiter_altitude = candidate_altitude
+                        loiter_direction = "ccw"
+                        theta_center = theta_ccw
+                        loiter_center = center_ccw
+                        print(f"    [规划] 找到可行画圆高度={loiter_altitude:.1f}m (大半径{loiter_radius:.1f}m, CCW)")
+                        break
+
+                    theta_cw = approach_heading + np.pi / 2.0
+                    center_cw = np.array([
+                        loiter_center_xy[0] - loiter_radius * np.cos(theta_cw),
+                        loiter_center_xy[1] - loiter_radius * np.sin(theta_cw),
+                        candidate_altitude
+                    ])
+
+                    if self._circle_ok(center_cw, loiter_radius, candidate_altitude):
+                        loiter_altitude = candidate_altitude
+                        loiter_direction = "cw"
+                        theta_center = theta_cw
+                        loiter_center = center_cw
+                        print(f"    [规划] 找到可行画圆高度={loiter_altitude:.1f}m (大半径{loiter_radius:.1f}m, CW)")
+                        break
+
+            # 如果还是找不到，跳过画圆
+            if loiter_altitude is None:
+                print(f"    [警告] 无法找到安全的画圆高度，跳过画圆消高")
+                loiter_altitude = terminal_altitude
+                loiter_loops = 0
+            else:
+                # ======== Step 3: 基于确定的画圆高度计算画圆圈数 ========
+                # 计算总共需要的直线距离（起点→画圆入口 + 画圆出口→目标）
+                altitude_loss_to_loiter = start_z - loiter_altitude
+                altitude_loss_from_loiter = loiter_altitude - target_z - altitude_margin
+
+                # 总共需要的直线距离
+                total_required_horizontal = (altitude_loss_to_loiter + altitude_loss_from_loiter) * glide_ratio
+
+                # 需要通过画圆补充的距离
+                extra_distance = max(0.0, total_required_horizontal - direct_distance)
+
+                # 计算画圆圈数
+                loiter_loops = 0
+                if extra_distance > 1e-3:
+                    loiter_loops = int(np.ceil(extra_distance / (2 * np.pi * loiter_radius)))
+                    print(f"    [规划] 需要画圆消高: 总需距离{total_required_horizontal:.0f}m > 直线距离{direct_distance:.0f}m")
+                    print(f"    [规划] 通过画圆补充{extra_distance:.0f}m，圈数={loiter_loops}，半径={loiter_radius:.1f}m")
+                else:
+                    print(f"    [规划] 无需画圆消高: 直线距离{direct_distance:.0f}m >= 总需距离{total_required_horizontal:.0f}m")
+
+        # Step 1-3 结束
+
+        # ======== Step 4: 计算画圆入口点和RRT*目标 ========
         if loiter_loops > 0:
+            # 需要画圆：RRT*目标是画圆入口点
             total_angle = 2 * np.pi * loiter_loops
             if loiter_direction == "ccw":
                 theta_end = approach_heading - np.pi / 2.0
@@ -457,24 +660,54 @@ class RRTStarPlanner:
                 theta_end = approach_heading + np.pi / 2.0
                 theta_start = theta_end + total_angle
                 tangent_sign = -1.0
-            
+
             # 画圆入口点（loiter_center已经在正确高度，z方向偏移为0）
             loiter_entry = loiter_center + np.array([
                 loiter_radius * np.cos(theta_start),
                 loiter_radius * np.sin(theta_start),
                 0.0  # z方向偏移为0
             ])
-            
+
             # RRT*的目标是画圆入口点
             rrt_goal = loiter_entry.copy()
         else:
-            # 不需要画圆，RRT*的目标是进场点
+            # 不需要画圆：RRT*目标是进场点
+            # 进场起点高度由滑翔比决定
+            required_approach_altitude = target_z + approach_length / glide_ratio if glide_ratio > 0 else terminal_altitude
+            approach_altitude = np.clip(required_approach_altitude,
+                                       self.min_altitude,  # 最低飞行高度
+                                       loiter_altitude)  # 不超过当前画圆高度
+
+            # 动态查找安全的进场点
+            safe_approach_point, actual_heading, actual_length = self.map.find_safe_approach_point(
+                target_pos=target_pos,
+                altitude=approach_altitude,
+                desired_heading=approach_heading,
+                max_length=approach_length,
+                min_length=target.min_approach_length,
+                heading_tolerance=target.approach_heading_tolerance
+            )
+
+            if safe_approach_point is None:
+                print(f"    [警告] 未找到安全进场点，使用期望参数")
+                approach_point = target_pos.copy()
+                approach_point[0] -= approach_length * np.cos(approach_heading)
+                approach_point[1] -= approach_length * np.sin(approach_heading)
+                approach_point[2] = approach_altitude
+            else:
+                approach_point = safe_approach_point
+                approach_heading = actual_heading
+                approach_length = actual_length
+
             rrt_goal = approach_point.copy()
             theta_start = 0
             theta_end = 0
             tangent_sign = 1.0
-        
-        # ======== Step 3: RRT*规划到画圆入口 ========
+
+            actual_glide_ratio = approach_length / (approach_altitude - target_z) if approach_altitude > target_z else 0
+            print(f"    [规划] 无需画圆，进场起点高度={approach_altitude:.1f}m (滑翔比{actual_glide_ratio:.2f})")
+
+        # ======== Step 5: RRT*规划到画圆入口 ========
         print(f"    [规划] RRT*目标: {'画圆入口点' if loiter_loops > 0 else '进场点'} (高度{rrt_goal[2]:.1f}m)")
 
         # 不添加最终目标，因为后面会手动添加画圆和进场航点
@@ -483,110 +716,115 @@ class RRTStarPlanner:
         if path_to_entry is None:
             return None, info
 
-        # ======== Step 3.5: 检查并修复RRT*路径末端到画圆高度的平滑过渡 ========
-        # 问题：RRT*可能在距离目标较远处连接，导致多个点低于画圆高度，造成突然跳升
-        # 解决：从后往前找到所有低于画圆高度的点，从第一个高点开始平滑下降
-        if loiter_loops > 0 and len(path_to_entry) >= 2:
-            print(f"    [调试] 画圆高度={loiter_altitude:.1f}m")
-            print(f"    [调试] RRT*路径最后5个点的高度: ", end="")
-            for i in range(max(0, len(path_to_entry)-5), len(path_to_entry)):
-                print(f"[{i}]={path_to_entry[i][2]:.1f}m ", end="")
-            print()
+        # ======== Step 5.5: 验证RRT*路径的滑翔比约束 ========
+        # 检查起点到画圆入口的整体滑翔比是否满足约束
+        path_horizontal_dist = 0.0
+        for i in range(len(path_to_entry) - 1):
+            path_horizontal_dist += np.linalg.norm(path_to_entry[i+1][:2] - path_to_entry[i][:2])
 
-            # 从后往前扫描，找到第一个高度>=画圆高度的点
-            split_idx = -1
-            for i in range(len(path_to_entry) - 1, -1, -1):
-                if path_to_entry[i][2] >= loiter_altitude:
-                    split_idx = i
-                    break
+        path_altitude_loss = start[2] - path_to_entry[-1][2]
+        path_glide_ratio = path_horizontal_dist / path_altitude_loss if path_altitude_loss > 1.0 else 0.0
 
-            if split_idx == -1:
-                # 所有点都低于画圆高度，这不应该发生（起点应该更高）
-                print(f"    [警告] RRT*路径所有点都低于画圆高度，强制最后一个点为画圆高度")
-                path_to_entry[-1] = path_to_entry[-1].copy()
-                path_to_entry[-1][2] = loiter_altitude
-            elif split_idx == len(path_to_entry) - 1:
-                # 最后一个点已经>=画圆高度，无需调整
-                print(f"    [调试] 最后一个点高度已>=画圆高度，无需调整")
-            else:
-                # 有点低于画圆高度，需要调整
-                n_low_points = len(path_to_entry) - 1 - split_idx
-                start_point = path_to_entry[split_idx].copy()
-                end_point = path_to_entry[-1].copy()  # 画圆入口点
+        print(f"    [验证] 起点→画圆入口: 水平{path_horizontal_dist:.0f}m, 下降{path_altitude_loss:.0f}m, 滑翔比{path_glide_ratio:.2f}")
 
-                print(f"    [调试] 发现{n_low_points}个点低于画圆高度")
-                print(f"    [调试] 从点[{split_idx}](高度{start_point[2]:.1f}m)到点[{len(path_to_entry)-1}](高度{end_point[2]:.1f}m)")
+        if path_glide_ratio > glide_ratio * 1.1:
+            print(f"    [警告] RRT*路径滑翔比{path_glide_ratio:.2f}超过最大值{glide_ratio:.2f}！")
+            print(f"    [警告] 翼伞可能无法跟踪此轨迹，建议：")
+            print(f"    [警告]   1. 降低画圆入口高度")
+            print(f"    [警告]   2. 或增加路径绕行距离")
 
-                # 移除split_idx之后的所有点（包括画圆入口点）
-                path_to_entry = path_to_entry[:split_idx+1]
-
-                # 插入平滑过渡点：从start_point平滑下降到loiter_altitude
-                horizontal_dist = np.linalg.norm(end_point[:2] - start_point[:2])
-                n_transition = max(int(horizontal_dist / 10), n_low_points + 2)  # 至少和原来一样多，每10m至少1个点
-
-                for i in range(1, n_transition + 1):
-                    alpha = i / n_transition
-                    # 水平位置线性插值
-                    new_pt = start_point + alpha * (end_point - start_point)
-                    # 高度从start_point[2]线性下降到loiter_altitude
-                    new_pt[2] = start_point[2] + alpha * (loiter_altitude - start_point[2])
-                    path_to_entry.append(new_pt)
-
-                print(f"    [规划] 插入{n_transition}个过渡点，从{start_point[2]:.1f}m平滑下降到{loiter_altitude:.1f}m")
-        
-        # ======== Step 4: 生成画圆航点 ========
-        loiter_waypoints = []
+        # ======== Step 6: 计算几何参数（交给平滑器使用） ========
+        # 计算进场起点的高度（画圆出口高度 或 直飞的进场高度）
         if loiter_loops > 0:
-            n_points_per_loop = 36  # 每圈36个点（每10度一个点）
-            n_total_points = loiter_loops * n_points_per_loop
-            thetas = np.linspace(theta_start, theta_end, n_total_points + 1)
-            
-            for theta in thetas:
-                wp = loiter_center + np.array([
-                    loiter_radius * np.cos(theta),
-                    loiter_radius * np.sin(theta),
-                    0.0  # z方向偏移为0，loiter_center已经在正确高度
-                ])
-                loiter_waypoints.append(wp)
-            
-            print(f"    [规划] 画圆消高: {loiter_loops}圈, 半径={loiter_radius:.1f}m, {len(loiter_waypoints)}个航点")
-        
-        # ======== Step 5: 生成进场航点 ========
-        approach_waypoints = []
-        # 从画圆出口（或进场点）到目标的直线
+            # 画圆消高：计算画圆出口高度
+            # 进场段滑翔比 = approach_length / (loiter_exit - target_z) <= glide_ratio
+            # => loiter_exit >= target_z + approach_length / glide_ratio
+            required_approach_altitude = target_z + approach_length / glide_ratio
+
+            loiter_exit_altitude = max(
+                required_approach_altitude,  # 满足进场段滑翔比<=glide_ratio
+                self.min_altitude  # 不低于最低飞行高度
+            )
+
+            # 确保画圆能消耗足够的高度
+            if loiter_altitude - loiter_exit_altitude < 20:
+                print(f"    [警告] 画圆入口高度{loiter_altitude:.1f}m过低，调整出口高度")
+                loiter_exit_altitude = min(loiter_exit_altitude, loiter_altitude - 20)
+
+            altitude_loss = loiter_altitude - loiter_exit_altitude
+            print(f"    [规划] 画圆消高: {loiter_loops}圈, 半径={loiter_radius:.1f}m")
+            print(f"    [规划]   入口高度={loiter_altitude:.1f}m, 出口高度={loiter_exit_altitude:.1f}m, 消高={altitude_loss:.1f}m")
+
+            approach_start_altitude = loiter_exit_altitude
+        else:
+            # 直飞：计算进场起点高度
+            required_approach_altitude = target_z + approach_length / glide_ratio if glide_ratio > 0 else terminal_altitude
+            approach_start_altitude = np.clip(required_approach_altitude,
+                                             self.min_altitude,
+                                             start_z - 10)
+            loiter_exit_altitude = approach_start_altitude  # 用于后续计算
+            print(f"    [规划] 直飞模式，进场起点高度={approach_start_altitude:.1f}m")
+
+        # 搜索安全的进场起点
+        safe_approach_point, actual_heading, actual_length = self.map.find_safe_approach_point(
+            target_pos=target_pos,
+            altitude=approach_start_altitude,
+            desired_heading=approach_heading,
+            max_length=approach_length,
+            min_length=target.min_approach_length,
+            heading_tolerance=target.approach_heading_tolerance
+        )
+
+        if safe_approach_point is None:
+            print(f"    [警告] 未找到安全进场点，使用期望参数")
+            safe_approach_point = target_pos.copy()
+            safe_approach_point[0] -= approach_length * np.cos(approach_heading)
+            safe_approach_point[1] -= approach_length * np.sin(approach_heading)
+            safe_approach_point[2] = approach_start_altitude
+            actual_heading = approach_heading
+            actual_length = approach_length
+
+        # ======== 收集几何参数到info（交给平滑器处理） ========
+        print(f"\n    [规划] 前端规划完成，参数传递给平滑器：")
+
+        # 画圆参数（如果需要）
         if loiter_loops > 0:
-            start_approach = loiter_waypoints[-1]  # 画圆出口
+            info['loiter'] = {
+                'center': loiter_center.copy(),
+                'radius': loiter_radius,
+                'loops': loiter_loops,
+                'entry_altitude': loiter_altitude,
+                'exit_altitude': loiter_exit_altitude,
+                'direction': loiter_direction,
+                'theta_start': theta_start,
+                'theta_end': theta_end
+            }
+            print(f"      画圆参数: {loiter_loops}圈, 半径={loiter_radius:.1f}m, 方向={loiter_direction}")
         else:
-            start_approach = path_to_entry[-1] if path_to_entry else rrt_goal
-        
-        # 检查进场路径是否有碰撞
-        if not self.map.is_path_collision(start_approach, target_pos):
-            # 生成进场航点（从进场点到目标）
-            n_approach_points = max(int(approach_length / 10), 2)  # 每10m一个点
-            for i in range(1, n_approach_points + 1):
-                alpha = i / n_approach_points
-                wp = start_approach + alpha * (target_pos - start_approach)
-                approach_waypoints.append(wp)
-            print(f"    [规划] 进场直线: {len(approach_waypoints)}个航点")
-        else:
-            print(f"    [警告] 进场路径有碰撞，需要额外规划")
-            # TODO: 可以在这里添加额外的RRT*规划
-            approach_waypoints = [target_pos.copy()]
-        
-        # ======== Step 6: 合并所有航点 ========
-        full_path = path_to_entry.copy()
-        full_path.extend(loiter_waypoints)
-        full_path.extend(approach_waypoints)
-        
-        # 更新info
-        info['loiter_loops'] = loiter_loops
-        info['loiter_radius'] = loiter_radius if loiter_loops > 0 else 0
-        info['loiter_direction'] = loiter_direction if loiter_loops > 0 else None
-        info['total_waypoints'] = len(full_path)
-        info['path_length'] = self._path_length(full_path)
-        
-        return full_path, info
-    
+            info['loiter'] = None
+            print(f"      画圆参数: 无（直飞模式）")
+
+        # 进场参数
+        info['approach'] = {
+            'point': safe_approach_point.copy(),
+            'heading': actual_heading,
+            'length': actual_length
+        }
+        print(f"      进场参数: 起点高度={safe_approach_point[2]:.1f}m, 航向={np.degrees(actual_heading):.1f}°, 长度={actual_length:.0f}m")
+
+        # 目标点
+        info['target_pos'] = target_pos.copy()
+        print(f"      目标点: ({target_pos[0]:.1f}, {target_pos[1]:.1f}, {target_pos[2]:.1f})")
+
+        # RRT*路径信息
+        info['path_length'] = self._path_length(path_to_entry)
+        info['rrt_waypoints'] = len(path_to_entry)
+        print(f"      RRT*路径: {len(path_to_entry)}个航点, 长度={info['path_length']:.1f}m")
+
+        print(f"\n    [✓] 前端规划完成，返回RRT*原始路径（{len(path_to_entry)}个航点）")
+        print(f"        后续由平滑器添加几何段（画圆+进场）并处理平滑过渡\n")
+
+        return path_to_entry, info
     def _circle_ok(self, center: np.ndarray, radius: float, z: float) -> bool:
         """检查画圆区域是否有碰撞"""
         for theta in np.linspace(0, 2 * np.pi, 36, endpoint=False):

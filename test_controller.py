@@ -44,8 +44,8 @@ def test_controller():
         heading_eso_omega=3.0,
         heading_td_r=10.0,
         lateral_kp=0.002,
-        glide_ratio_natural=11.0,   # Natural glide ratio (no symmetric deflection)
-        glide_ratio_min=5.0,        # Minimum glide ratio (max symmetric deflection)
+        glide_ratio_natural=6.48,   # Natural glide ratio (no symmetric deflection)
+        glide_ratio_min=2.47,       # Minimum glide ratio (max symmetric deflection)
         descent_kp=0.5,             # Descent rate control gain
         descent_margin=1.2,         # Glide ratio margin factor
         reference_speed=12.0,
