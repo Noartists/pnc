@@ -1,6 +1,12 @@
 # 翼伞无人机规划与控制系统 (PNC)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 翼伞无人机路径规划与控制项目，包含动力学建模、全局路径规划、轨迹平滑、ADRC控制器、闭环仿真和Web可视化模块。
+
+> **维护者**: [张驰]  
+> **联系方式**: [zhangchi9900@gmail.com]  
+> **实验室**: [南开大学智能预测自适应实验室]
 
 ---
 
