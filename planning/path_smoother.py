@@ -44,16 +44,21 @@ class PathSmoother:
                start_heading: Optional[float] = None,
                end_heading: Optional[float] = None,
                waypoint_density: int = 3,
-               map_manager=None) -> Trajectory:
+               map_manager=None,
+               info: Optional[dict] = None) -> Trajectory:
         """
-        平滑路径并生成带时间信息的轨迹
+        平滑路径并生成带时间信息的轨迹（前后端分离架构）
 
         参数:
-            waypoints: 路径点列表 [[x, y, z], ...]
+            waypoints: RRT*原始路径点列表 [[x, y, z], ...]
             start_heading: 起点航向 (rad)，None 则自动计算
-            end_heading: 终点航向 (rad)，None 则自动计算
+            end_heading: 终点航向 (rad)，None 则自动计算（优先使用info中的进场航向）
             waypoint_density: 航点加密倍数 (在原始航点间插入的点数+1)
-            map_manager: 地图管理器（可选），如果提供则添加进场点、盘旋消高和进场直线段
+            map_manager: 地图管理器（兼容旧接口，优先使用info）
+            info: 规划器传来的几何参数字典，包含：
+                - loiter: 画圆参数（如果需要），None表示不画圆
+                - approach: 进场参数 {point, heading, length}
+                - target_pos: 目标点位置
 
         返回:
             Trajectory 对象，包含完整的时间、位置、速度、曲率信息
@@ -63,9 +68,67 @@ class PathSmoother:
             return Trajectory(dt=self.dt)
 
         waypoints = [np.array(wp) for wp in waypoints]
-        
-        # 如果提供了map_manager，移除最后的目标点（如果高度低于进场点），只保留到进场点
-        if map_manager is not None and map_manager.target is not None:
+
+        # ======== 前后端分离架构：使用info参数生成几何段 ========
+        if info is not None:
+            print(f"\n    [平滑器] 后端开始处理（前后端分离架构）")
+            print(f"      输入: RRT*路径 {len(waypoints)} 个航点")
+
+            # Step 1: 平滑RRT*主路径
+            print(f"      Step 1/4: 平滑RRT*主路径...")
+            smooth_main_path = waypoints  # 先直接使用，后面会三次样条平滑
+
+            # Step 2: 如果需要画圆，生成画圆段
+            if info.get('loiter') is not None:
+                print(f"      Step 2/4: 生成画圆螺旋段...")
+                loiter_segment = self._generate_loiter_spiral(info['loiter'])
+                print(f"        生成 {len(loiter_segment)} 个画圆航点")
+
+                # 平滑过渡：RRT*末端 → 画圆入口
+                transition1 = self._smooth_transition(smooth_main_path, loiter_segment)
+
+                # 合并路径
+                combined_path = smooth_main_path + transition1 + loiter_segment
+                last_point = loiter_segment[-1]
+            else:
+                print(f"      Step 2/4: 跳过画圆（直飞模式）")
+                combined_path = smooth_main_path
+                last_point = smooth_main_path[-1]
+
+            # Step 3: 添加进场段
+            if info.get('approach') is not None:
+                print(f"      Step 3/4: 生成进场直线段...")
+                approach_params = info['approach']
+                target_pos = info['target_pos']
+
+                # 生成进场直线段
+                approach_segment = self._generate_straight_line(
+                    start=approach_params['point'],
+                    end=target_pos,
+                    num_points=15
+                )
+                print(f"        生成 {len(approach_segment)} 个进场航点")
+
+                # 平滑过渡：画圆出口（或RRT*末端）→ 进场起点
+                transition2 = self._smooth_transition([last_point], approach_segment)
+
+                # 最终路径
+                final_waypoints = combined_path + transition2 + approach_segment
+
+                # 设置末端航向为进场航向
+                if end_heading is None:
+                    end_heading = approach_params['heading']
+            else:
+                final_waypoints = combined_path
+
+            print(f"      Step 4/4: 三次样条全局平滑...")
+            print(f"        总航点数: {len(final_waypoints)}")
+
+            # 使用合并后的路径
+            waypoints = final_waypoints
+
+        # ======== 兼容旧接口：map_manager参数（优先使用info） ========
+        elif map_manager is not None and map_manager.target is not None:
             approach_point = map_manager.target.get_approach_point(
                 map_manager.constraints.terminal_altitude
             )
@@ -915,6 +978,510 @@ class PathSmoother:
 
         curvatures.append(0)
         return np.array(curvatures)
+
+    # ========== 几何段生成方法（前后端分离架构） ==========
+
+    def _generate_loiter_spiral(self, loiter_params: dict) -> List[np.ndarray]:
+        """
+        生成画圆螺旋下降段
+
+        参数:
+            loiter_params: 画圆参数字典，包含：
+                - center: 画圆中心 [x, y, z]
+                - radius: 画圆半径 (m)
+                - loops: 圈数
+                - entry_altitude: 入口高度 (m)
+                - exit_altitude: 出口高度 (m)
+                - direction: "ccw" (逆时针) 或 "cw" (顺时针)
+                - theta_start: 起始角度 (rad)
+                - theta_end: 结束角度 (rad)
+
+        返回:
+            航点列表
+        """
+        center = loiter_params['center']
+        radius = loiter_params['radius']
+        loops = loiter_params['loops']
+        entry_alt = loiter_params['entry_altitude']
+        exit_alt = loiter_params['exit_altitude']
+        theta_start = loiter_params['theta_start']
+        theta_end = loiter_params['theta_end']
+
+        # 每圈36个点（每10度一个点）
+        n_points_per_loop = 36
+        n_total_points = loops * n_points_per_loop + 1
+
+        # 生成角度序列
+        thetas = np.linspace(theta_start, theta_end, n_total_points)
+
+        waypoints = []
+        for i, theta in enumerate(thetas):
+            # 高度线性下降
+            alpha = i / (n_total_points - 1)
+            altitude = entry_alt + alpha * (exit_alt - entry_alt)
+
+            # 位置
+            wp = np.array([
+                center[0] + radius * np.cos(theta),
+                center[1] + radius * np.sin(theta),
+                altitude
+            ])
+            waypoints.append(wp)
+
+        return waypoints
+
+    def _generate_straight_line(self, start: np.ndarray, end: np.ndarray,
+                                num_points: int = 15) -> List[np.ndarray]:
+        """
+        生成直线段
+
+        参数:
+            start: 起点 [x, y, z]
+            end: 终点 [x, y, z]
+            num_points: 航点数量
+
+        返回:
+            航点列表
+        """
+        waypoints = []
+        for i in range(num_points + 1):
+            alpha = i / num_points
+            wp = start + alpha * (end - start)
+            waypoints.append(wp)
+
+        return waypoints
+
+    def _compute_heading(self, p1: np.ndarray, p2: np.ndarray) -> float:
+        """计算从p1到p2的航向（弧度）"""
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        return np.arctan2(dy, dx)
+
+    def _wrap_angle(self, angle: float) -> float:
+        """将角度归一化到 [-pi, pi]"""
+        return (angle + np.pi) % (2 * np.pi) - np.pi
+
+    def _smooth_transition(self, path1: List[np.ndarray], path2: List[np.ndarray],
+                          turn_radius: float = None) -> List[np.ndarray]:
+        """
+        使用Dubins曲线平滑连接两段路径
+        
+        Dubins曲线是连接两个位置和朝向的最短路径，由最多三段组成（直线和圆弧的组合）。
+        保证曲率不超过1/turn_radius，满足最小转弯半径约束。
+
+        参数:
+            path1: 第一段路径
+            path2: 第二段路径
+            turn_radius: 转弯半径（默认使用self.turn_radius）
+
+        返回:
+            过渡航点列表
+        """
+        if turn_radius is None:
+            turn_radius = self.turn_radius
+
+        if len(path1) < 1 or len(path2) < 1:
+            return []
+
+        # 两段路径的连接点
+        p1 = path1[-1]  # 第一段的终点
+        p2 = path2[0]   # 第二段的起点
+
+        # 计算航向
+        # 第一段的末端航向
+        if len(path1) >= 2:
+            heading1 = self._compute_heading(path1[-2], path1[-1])
+        else:
+            heading1 = self._compute_heading(p1, p2)
+
+        # 第二段的起点航向
+        if len(path2) >= 2:
+            heading2 = self._compute_heading(path2[0], path2[1])
+        else:
+            heading2 = heading1
+
+        # 计算航向差
+        heading_diff = self._wrap_angle(heading2 - heading1)
+
+        # 如果航向差小于5度，直接连接
+        if abs(heading_diff) < np.radians(5):
+            dist = np.linalg.norm(p2[:2] - p1[:2])
+            if dist < 10:
+                return []
+            else:
+                # 插入过渡点
+                n_points = max(2, int(dist / 10))
+                transition = []
+                for i in range(1, n_points):
+                    alpha = i / n_points
+                    pt = p1 + alpha * (p2 - p1)
+                    transition.append(pt)
+                return transition
+
+        # 使用Dubins曲线生成过渡
+        return self._generate_dubins_path(p1, heading1, p2, heading2, turn_radius)
+    
+    def _generate_dubins_path(self, p1: np.ndarray, heading1: float, 
+                               p2: np.ndarray, heading2: float,
+                               turn_radius: float) -> List[np.ndarray]:
+        """
+        生成Dubins曲线路径（纯Python实现，无需外部库）
+        
+        Dubins曲线是连接两个位姿的最短路径，由三段组成：
+        - LSL: 左转-直行-左转
+        - RSR: 右转-直行-右转
+        - LSR: 左转-直行-右转
+        - RSL: 右转-直行-左转
+        - RLR: 右转-左转-右转
+        - LRL: 左转-右转-左转
+        
+        参数:
+            p1: 起点 [x, y, z]
+            heading1: 起点航向 (rad)
+            p2: 终点 [x, y, z]
+            heading2: 终点航向 (rad)
+            turn_radius: 最小转弯半径
+        
+        返回:
+            Dubins曲线航点列表
+        """
+        # 计算所有可能的Dubins路径，选择最短的
+        paths = []
+        
+        # 尝试6种Dubins路径类型
+        for path_type in ['LSL', 'RSR', 'LSR', 'RSL', 'RLR', 'LRL']:
+            result = self._compute_dubins_path(p1[:2], heading1, p2[:2], heading2, turn_radius, path_type)
+            if result is not None:
+                paths.append(result)
+        
+        if not paths:
+            # 如果所有Dubins路径都失败，使用备选方案
+            return self._generate_simple_arc_path(p1, heading1, p2, heading2, turn_radius)
+        
+        # 选择最短路径
+        best_path = min(paths, key=lambda x: x['length'])
+        
+        # 采样生成航点
+        return self._sample_dubins_path(best_path, p1[2], p2[2], turn_radius)
+    
+    def _compute_dubins_path(self, p1: np.ndarray, theta1: float,
+                              p2: np.ndarray, theta2: float,
+                              rho: float, path_type: str):
+        """
+        计算指定类型的Dubins路径参数
+        
+        参数:
+            p1: 起点 [x, y]
+            theta1: 起点航向
+            p2: 终点 [x, y]
+            theta2: 终点航向
+            rho: 转弯半径
+            path_type: 路径类型 ('LSL', 'RSR', 'LSR', 'RSL', 'RLR', 'LRL')
+        
+        返回:
+            路径参数字典，或None（如果路径不存在）
+        """
+        # 转换到归一化坐标系
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        D = np.sqrt(dx**2 + dy**2) / rho
+        
+        if D < 1e-10:
+            return None
+        
+        d = np.sqrt(dx**2 + dy**2)
+        phi = np.arctan2(dy, dx)
+        
+        alpha = self._wrap_angle(theta1 - phi)
+        beta = self._wrap_angle(theta2 - phi)
+        
+        # 根据路径类型计算三段的长度
+        try:
+            if path_type == 'LSL':
+                result = self._dubins_LSL(alpha, beta, D)
+            elif path_type == 'RSR':
+                result = self._dubins_RSR(alpha, beta, D)
+            elif path_type == 'LSR':
+                result = self._dubins_LSR(alpha, beta, D)
+            elif path_type == 'RSL':
+                result = self._dubins_RSL(alpha, beta, D)
+            elif path_type == 'RLR':
+                result = self._dubins_RLR(alpha, beta, D)
+            elif path_type == 'LRL':
+                result = self._dubins_LRL(alpha, beta, D)
+            else:
+                return None
+        except:
+            return None
+        
+        if result is None:
+            return None
+        
+        t, p, q = result
+        length = (t + p + q) * rho
+        
+        return {
+            'type': path_type,
+            'lengths': (t * rho, p * rho, q * rho),
+            'start': p1,
+            'start_theta': theta1,
+            'end': p2,
+            'end_theta': theta2,
+            'rho': rho,
+            'length': length
+        }
+    
+    def _dubins_LSL(self, alpha, beta, d):
+        """LSL路径"""
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        cb, sb = np.cos(beta), np.sin(beta)
+        tmp = 2 + d**2 - 2*(ca*cb + sa*sb - d*(sa - sb))
+        if tmp < 0:
+            return None
+        p = np.sqrt(tmp)
+        theta = np.arctan2(cb - ca, d + sa - sb)
+        t = self._wrap_angle(-alpha + theta)
+        q = self._wrap_angle(beta - theta)
+        return (t, p, q)
+    
+    def _dubins_RSR(self, alpha, beta, d):
+        """RSR路径"""
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        cb, sb = np.cos(beta), np.sin(beta)
+        tmp = 2 + d**2 - 2*(ca*cb + sa*sb - d*(sb - sa))
+        if tmp < 0:
+            return None
+        p = np.sqrt(tmp)
+        theta = np.arctan2(ca - cb, d - sa + sb)
+        t = self._wrap_angle(alpha - theta)
+        q = self._wrap_angle(-beta + theta)
+        return (t, p, q)
+    
+    def _dubins_LSR(self, alpha, beta, d):
+        """LSR路径"""
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        cb, sb = np.cos(beta), np.sin(beta)
+        tmp = -2 + d**2 + 2*(ca*cb + sa*sb - d*(sa + sb))
+        if tmp < 0:
+            return None
+        p = np.sqrt(tmp)
+        theta = np.arctan2(-ca - cb, d + sa + sb) - np.arctan2(-2, p)
+        t = self._wrap_angle(-alpha + theta)
+        q = self._wrap_angle(-beta + theta)
+        return (t, p, q)
+    
+    def _dubins_RSL(self, alpha, beta, d):
+        """RSL路径"""
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        cb, sb = np.cos(beta), np.sin(beta)
+        tmp = -2 + d**2 + 2*(ca*cb + sa*sb + d*(sa + sb))
+        if tmp < 0:
+            return None
+        p = np.sqrt(tmp)
+        theta = np.arctan2(ca + cb, d - sa - sb) - np.arctan2(2, p)
+        t = self._wrap_angle(alpha - theta)
+        q = self._wrap_angle(beta - theta)
+        return (t, p, q)
+    
+    def _dubins_RLR(self, alpha, beta, d):
+        """RLR路径"""
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        cb, sb = np.cos(beta), np.sin(beta)
+        tmp = (6 - d**2 + 2*(ca*cb + sa*sb + d*(sa - sb))) / 8
+        if abs(tmp) > 1:
+            return None
+        p = self._wrap_angle(2*np.pi - np.arccos(tmp))
+        theta = np.arctan2(ca - cb, d - sa + sb)
+        t = self._wrap_angle(alpha - theta + p/2)
+        q = self._wrap_angle(alpha - beta - t + p)
+        return (t, p, q)
+    
+    def _dubins_LRL(self, alpha, beta, d):
+        """LRL路径"""
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        cb, sb = np.cos(beta), np.sin(beta)
+        tmp = (6 - d**2 + 2*(ca*cb + sa*sb - d*(sa - sb))) / 8
+        if abs(tmp) > 1:
+            return None
+        p = self._wrap_angle(2*np.pi - np.arccos(tmp))
+        theta = np.arctan2(-ca + cb, d + sa - sb)
+        t = self._wrap_angle(-alpha + theta + p/2)
+        q = self._wrap_angle(beta - alpha - t + p)
+        return (t, p, q)
+    
+    def _sample_dubins_path(self, path_info: dict, z1: float, z2: float, rho: float) -> List[np.ndarray]:
+        """
+        采样Dubins路径生成航点
+        
+        参数:
+            path_info: 路径参数
+            z1: 起点高度
+            z2: 终点高度
+            rho: 转弯半径
+        
+        返回:
+            航点列表
+        """
+        path_type = path_info['type']
+        lengths = path_info['lengths']
+        total_length = path_info['length']
+        
+        if total_length < 1e-6:
+            return []
+        
+        # 每5米采样一个点
+        step_size = 5.0
+        n_samples = max(3, int(total_length / step_size))
+        
+        transition = []
+        x, y = path_info['start']
+        theta = path_info['start_theta']
+        
+        for i in range(1, n_samples):
+            s = (i / n_samples) * total_length
+            
+            # 计算当前位置
+            x, y, theta = self._dubins_position_at(path_info, s)
+            
+            # 高度线性插值
+            alpha = i / n_samples
+            z = z1 + alpha * (z2 - z1)
+            
+            transition.append(np.array([x, y, z]))
+        
+        return transition
+    
+    def _dubins_position_at(self, path_info: dict, s: float):
+        """
+        计算Dubins路径上距离起点s处的位置
+        
+        参数:
+            path_info: 路径参数
+            s: 距离起点的弧长
+        
+        返回:
+            (x, y, theta)
+        """
+        path_type = path_info['type']
+        lengths = path_info['lengths']
+        rho = path_info['rho']
+        
+        x, y = path_info['start']
+        theta = path_info['start_theta']
+        
+        # 三段的方向：L=1(左转), R=-1(右转), S=0(直行)
+        directions = {
+            'LSL': [1, 0, 1],
+            'RSR': [-1, 0, -1],
+            'LSR': [1, 0, -1],
+            'RSL': [-1, 0, 1],
+            'RLR': [-1, 1, -1],
+            'LRL': [1, -1, 1]
+        }
+        
+        dirs = directions[path_type]
+        
+        remaining = s
+        for seg_idx in range(3):
+            seg_len = lengths[seg_idx]
+            d = dirs[seg_idx]
+            
+            if remaining <= seg_len:
+                # 在当前段内
+                if d == 0:  # 直行
+                    x += remaining * np.cos(theta)
+                    y += remaining * np.sin(theta)
+                else:  # 转弯
+                    arc_angle = remaining / rho
+                    if d == 1:  # 左转
+                        cx = x - rho * np.sin(theta)
+                        cy = y + rho * np.cos(theta)
+                        theta_new = theta + arc_angle
+                        x = cx + rho * np.sin(theta_new)
+                        y = cy - rho * np.cos(theta_new)
+                        theta = theta_new
+                    else:  # 右转
+                        cx = x + rho * np.sin(theta)
+                        cy = y - rho * np.cos(theta)
+                        theta_new = theta - arc_angle
+                        x = cx - rho * np.sin(theta_new)
+                        y = cy + rho * np.cos(theta_new)
+                        theta = theta_new
+                break
+            else:
+                # 完成当前段
+                if d == 0:  # 直行
+                    x += seg_len * np.cos(theta)
+                    y += seg_len * np.sin(theta)
+                else:  # 转弯
+                    arc_angle = seg_len / rho
+                    if d == 1:  # 左转
+                        cx = x - rho * np.sin(theta)
+                        cy = y + rho * np.cos(theta)
+                        theta += arc_angle
+                        x = cx + rho * np.sin(theta)
+                        y = cy - rho * np.cos(theta)
+                    else:  # 右转
+                        cx = x + rho * np.sin(theta)
+                        cy = y - rho * np.cos(theta)
+                        theta -= arc_angle
+                        x = cx - rho * np.sin(theta)
+                        y = cy + rho * np.cos(theta)
+                remaining -= seg_len
+        
+        return x, y, theta
+    
+    def _generate_simple_arc_path(self, p1: np.ndarray, heading1: float,
+                                   p2: np.ndarray, heading2: float,
+                                   turn_radius: float) -> List[np.ndarray]:
+        """
+        简化的圆弧过渡（当dubins库不可用时的备选方案）
+        
+        参数:
+            p1: 起点 [x, y, z]
+            heading1: 起点航向 (rad)
+            p2: 终点 [x, y, z]
+            heading2: 终点航向 (rad)
+            turn_radius: 最小转弯半径
+        
+        返回:
+            过渡航点列表
+        """
+        heading_diff = self._wrap_angle(heading2 - heading1)
+        mid_point = (p1 + p2) / 2
+        
+        # 圆弧点数（每5度一个点）
+        n_arc_points = max(3, int(abs(heading_diff) / np.radians(5)))
+        
+        transition = []
+        for i in range(1, n_arc_points):
+            alpha = i / n_arc_points
+            current_heading = heading1 + alpha * heading_diff
+            
+            # 使用Hermite插值生成平滑曲线
+            # 起点和终点的切向量
+            t = alpha
+            h00 = 2*t**3 - 3*t**2 + 1  # 起点位置权重
+            h10 = t**3 - 2*t**2 + t     # 起点切向权重
+            h01 = -2*t**3 + 3*t**2      # 终点位置权重
+            h11 = t**3 - t**2           # 终点切向权重
+            
+            # 切向量长度（基于距离）
+            dist = np.linalg.norm(p2[:2] - p1[:2])
+            tangent_scale = dist * 0.5
+            
+            t1 = tangent_scale * np.array([np.cos(heading1), np.sin(heading1)])
+            t2 = tangent_scale * np.array([np.cos(heading2), np.sin(heading2)])
+            
+            # Hermite插值
+            x = h00 * p1[0] + h10 * t1[0] + h01 * p2[0] + h11 * t2[0]
+            y = h00 * p1[1] + h10 * t1[1] + h01 * p2[1] + h11 * t2[1]
+            z = p1[2] + alpha * (p2[2] - p1[2])  # 高度线性插值
+            
+            pt = np.array([x, y, z])
+            transition.append(pt)
+        
+        return transition
 
 
 def visualize_trajectory(trajectory: Trajectory,

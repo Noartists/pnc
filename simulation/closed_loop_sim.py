@@ -29,7 +29,8 @@ if ROOT_DIR not in sys.path:
 from planning.map_manager import MapManager
 from planning.global_planner import RRTStarPlanner
 from planning.path_smoother import PathSmoother
-from planning.trajectory import Trajectory
+from planning.trajectory import Trajectory, TrajectoryPoint
+from planning.kinodynamic_rrt import KinodynamicRRTStar
 from control.adrc_controller import ParafoilADRCController, ControlOutput
 from models.parafoil_model import ParafoilParams, parafoil_dynamics
 
@@ -172,7 +173,7 @@ class ClosedLoopSimulator:
             descent_margin=1.2,       # 滑翔比余量系数
             reference_speed=reference_speed,
             lookahead_distance=100.0, # 大：更平滑的转弯
-            max_deflection=0.5,       # 增加：允许更大偏转用于下降率控制
+            max_deflection=1.0,       # 打满：允许使用全部滑翔比范围[2.47, 6.48]
             dt=control_dt
         )
         
@@ -222,9 +223,198 @@ class ClosedLoopSimulator:
         )
         
         print(f"    生成轨迹: {len(self.trajectory)} 点, 时长 {self.trajectory.duration:.1f}s")
+        
+        # 验证轨迹的下降率是否在物理可行范围内
+        self._validate_trajectory_descent_rate()
+        
         self.controller.set_trajectory(self.trajectory)
         
         return True
+    
+    def plan_kinodynamic(self, max_time: float = 30.0) -> bool:
+        """
+        使用Kinodynamic RRT*规划路径
+        
+        相比旧方法，这个方法：
+        1. 在规划阶段就考虑滑翔比约束
+        2. 生成的轨迹更符合翼伞物理特性
+        
+        参数:
+            max_time: 最大规划时间 (s)
+        
+        返回:
+            是否成功
+        """
+        print("[3/4] 运行 Kinodynamic RRT* 路径规划...")
+        
+        # 创建Kinodynamic RRT*规划器
+        kino_planner = KinodynamicRRTStar(self.map_manager)
+        path, info = kino_planner.plan(max_time=max_time)
+        
+        if path is None:
+            print("    路径规划失败!")
+            return False
+        
+        print(f"    规划完成: {len(path)} 航点")
+        if 'path_length' in info:
+            print(f"    路径长度: {info['path_length']:.1f}m")
+        
+        # 将路径转换为Trajectory对象
+        print("[4/4] 生成轨迹...")
+        self.trajectory = self._path_to_trajectory(path)
+        
+        print(f"    生成轨迹: {len(self.trajectory)} 点, 时长 {self.trajectory.duration:.1f}s")
+        
+        # 验证轨迹
+        self._validate_trajectory_descent_rate()
+        
+        self.controller.set_trajectory(self.trajectory)
+        
+        return True
+    
+    def _path_to_trajectory(self, path: List[np.ndarray]) -> Trajectory:
+        """
+        将路径点列表转换为Trajectory对象
+        
+        参数:
+            path: 路径点列表 [np.array([x,y,z]), ...]
+        
+        返回:
+            Trajectory对象
+        """
+        trajectory = Trajectory()
+        
+        if len(path) < 2:
+            return trajectory
+        
+        # 计算每个点的信息
+        dt = 1.0 / self.smoother.control_frequency
+        t = 0.0
+        
+        for i, pos in enumerate(path):
+            # 计算航向
+            if i < len(path) - 1:
+                dx = path[i+1][0] - pos[0]
+                dy = path[i+1][1] - pos[1]
+                heading = np.arctan2(dy, dx)
+            else:
+                # 最后一点使用进场航向
+                heading = self.map_manager.target.approach_heading
+            
+            # 计算速度向量
+            velocity = self.reference_speed * np.array([
+                np.cos(heading), np.sin(heading), 0
+            ])
+            
+            # 计算下降分量
+            if i < len(path) - 1:
+                dz = pos[2] - path[i+1][2]
+                dxy = np.linalg.norm(path[i+1][:2] - pos[:2])
+                if dxy > 0:
+                    descent_rate = self.reference_speed * dz / dxy
+                    velocity[2] = -descent_rate
+            
+            # 估算曲率
+            curvature = 0.0
+            if 0 < i < len(path) - 1:
+                v1 = path[i][:2] - path[i-1][:2]
+                v2 = path[i+1][:2] - path[i][:2]
+                cross = v1[0]*v2[1] - v1[1]*v2[0]
+                d1, d2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                if d1 > 0 and d2 > 0:
+                    curvature = 2 * abs(cross) / (d1 * d2 * (d1 + d2))
+            
+            point = TrajectoryPoint(
+                t=t,
+                position=pos.copy(),
+                velocity=velocity,
+                heading=heading,
+                curvature=curvature
+            )
+            trajectory.append(point)
+            
+            # 计算到下一点的时间
+            if i < len(path) - 1:
+                dist = np.linalg.norm(path[i+1] - pos)
+                t += dist / self.reference_speed
+        
+        return trajectory
+    
+    def _validate_trajectory_descent_rate(self):
+        """
+        验证轨迹的下降率是否在翼伞物理可行范围内
+        
+        翼伞是欠驱动系统，下沉率有物理限制:
+        - 最小下沉率 = 速度 / 最大滑翔比
+        - 最大下沉率 = 速度 / 最小滑翔比
+        """
+        if self.trajectory is None or len(self.trajectory) < 2:
+            return
+        
+        # 从配置获取滑翔比
+        glide_max = self.map_manager.constraints.glide_ratio  # 6.48
+        glide_min = self.map_manager.constraints.min_glide_ratio  # 2.47
+        v = self.reference_speed  # 9 m/s
+        
+        # 物理极限下沉率
+        sink_rate_min = v / glide_max  # 最小下沉率 ≈ 1.4 m/s
+        sink_rate_max = v / glide_min  # 最大下沉率 ≈ 3.6 m/s
+        
+        print(f"\n    === 轨迹下降率验证 ===")
+        print(f"    物理可行下沉率: {sink_rate_min:.2f} ~ {sink_rate_max:.2f} m/s")
+        
+        # 分析轨迹的下降率
+        positions = self.trajectory.to_position_array()
+        n_points = len(positions)
+        
+        # 计算每段的下降率
+        climb_segments = 0  # 爬升段（不可能实现）
+        too_slow_segments = 0  # 下降太慢（可能难以实现）
+        too_fast_segments = 0  # 下降太快（会超前于轨迹）
+        ok_segments = 0
+        
+        window = 10  # 用10个点的窗口计算平均下降率
+        for i in range(0, n_points - window, window):
+            dz = positions[i, 2] - positions[i + window, 2]  # 高度变化（下降为正）
+            dxy = np.linalg.norm(positions[i + window, :2] - positions[i, :2])  # 水平距离
+            
+            if dxy < 1e-6:
+                continue
+                
+            # 实际下降率 = 下降高度 / 水平距离 × 速度
+            # 或者直接用 dz / dt，但我们用等效的滑翔比
+            actual_glide = dxy / max(dz, 0.01) if dz > 0 else float('inf')
+            
+            if dz < -1.0:  # 爬升超过1m
+                climb_segments += 1
+            elif actual_glide > glide_max * 1.2:  # 下降太慢
+                too_slow_segments += 1
+            elif actual_glide < glide_min * 0.8:  # 下降太快
+                too_fast_segments += 1
+            else:
+                ok_segments += 1
+        
+        total = climb_segments + too_slow_segments + too_fast_segments + ok_segments
+        if total > 0:
+            ok_ratio = ok_segments / total * 100
+            print(f"    轨迹段统计 (共{total}段):")
+            print(f"      - 可跟踪:   {ok_segments} ({ok_ratio:.1f}%)")
+            if climb_segments > 0:
+                print(f"      - 爬升段:   {climb_segments} (⚠️ 物理不可能!)")
+            if too_slow_segments > 0:
+                print(f"      - 下降过慢: {too_slow_segments} (⚠️ 可能难以跟踪)")
+            if too_fast_segments > 0:
+                print(f"      - 下降过快: {too_fast_segments} (会超前于轨迹)")
+        
+        # 整体下降率
+        total_dz = positions[0, 2] - positions[-1, 2]
+        total_dxy = 0
+        for i in range(n_points - 1):
+            total_dxy += np.linalg.norm(positions[i+1, :2] - positions[i, :2])
+        
+        if total_dxy > 0:
+            avg_glide = total_dxy / max(total_dz, 0.01)
+            print(f"    整体平均滑翔比: {avg_glide:.2f} (目标范围: {glide_min:.2f} ~ {glide_max:.2f})")
     
     def init_state(self, 
                    position: np.ndarray = None,
@@ -477,11 +667,25 @@ class ClosedLoopSimulator:
             print("=" * 60)
             print(f"  仿真完成")
             print(f"  仿真时长: {t:.1f}s, 计算耗时: {elapsed:.2f}s")
-            print(f"  轨迹跟踪进度: {self.controller.get_progress()*100:.1f}%")
-            final_pos = state[0:3]
-            target_pos = self.trajectory[-1].position if self.trajectory else np.zeros(3)
-            final_error = np.linalg.norm(final_pos - target_pos)
-            print(f"  最终位置误差: {final_error:.1f}m")
+            
+            # 计算跟踪指标
+            current_pos = state[0:3]
+            final_ref = self.trajectory[-1].position
+            
+            # 索引进度
+            index_progress = self.controller.get_progress()
+            
+            # 到目标终点的距离
+            dist_to_goal = np.linalg.norm(current_pos - final_ref)
+            horizontal_to_goal = np.linalg.norm(current_pos[:2] - final_ref[:2])
+            altitude_to_goal = current_pos[2] - final_ref[2]
+            
+            print(f"\n  === 跟踪质量指标 ===")
+            print(f"  索引进度:     {index_progress*100:.1f}% (轨迹点遍历)")
+            print(f"  ")
+            print(f"  到目标终点:   {dist_to_goal:.1f}m")
+            print(f"    - 水平距离: {horizontal_to_goal:.1f}m")
+            print(f"    - 高度差:   {altitude_to_goal:+.1f}m")
             print("=" * 60)
         
         return self.log
@@ -605,6 +809,9 @@ if __name__ == "__main__":
                         help="初始位置噪声 [dx, dy, dz]")
     parser.add_argument("--heading-noise", type=float, default=0.1,
                         help="初始航向噪声 (rad)")
+    parser.add_argument("--planner", type=str, default="kinodynamic",
+                        choices=["old", "kinodynamic"],
+                        help="规划器类型: old=旧RRT*, kinodynamic=新Kinodynamic RRT*")
     args = parser.parse_args()
     
     # 创建仿真器
@@ -616,7 +823,12 @@ if __name__ == "__main__":
     )
     
     # 规划
-    if not sim.plan(max_time=30.0):
+    if args.planner == "kinodynamic":
+        success = sim.plan_kinodynamic(max_time=30.0)
+    else:
+        success = sim.plan(max_time=30.0)
+    
+    if not success:
         exit(1)
     
     # 初始化状态 (加一点初始偏差)
