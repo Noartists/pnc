@@ -859,6 +859,106 @@ class KinodynamicRRTStar:
         
         return path
 
+    def export_to_json(self, output_dir: str = None, path: List[np.ndarray] = None, 
+                       path_length: float = None) -> str:
+        """
+        导出RRT数据为JSON文件（用于Web可视化）
+        
+        参数:
+            output_dir: 输出目录（默认: visualization/data/）
+            path: 最终路径（可选）
+            path_length: 路径长度（可选）
+            
+        返回:
+            生成的文件路径
+        """
+        import json
+        import os
+        from datetime import datetime
+        
+        # 默认输出目录
+        if output_dir is None:
+            output_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'visualization', 'data'
+            )
+        
+        # 创建目录（如果不存在）
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 生成唯一文件名：rrt_YYYYMMDD_HHMMSS_微秒.json
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        success_tag = 'ok' if path else 'fail'
+        filename = f'rrt_{timestamp}_{success_tag}.json'
+        filepath = os.path.join(output_dir, filename)
+        
+        # 节点数据
+        nodes_data = []
+        for i, node in enumerate(self.nodes):
+            nodes_data.append({
+                'x': float(node.state.x),
+                'y': float(node.state.y),
+                'z': float(node.state.z),
+                'heading': float(node.state.heading),
+                'parent_idx': node.parent,
+                'cost': float(node.cost)
+            })
+        
+        # 路径数据
+        path_data = []
+        if path:
+            for pt in path:
+                path_data.append([float(pt[0]), float(pt[1]), float(pt[2])])
+        
+        # 障碍物数据
+        obstacles_data = []
+        for obs in self.map.obstacles:
+            if hasattr(obs, 'radius'):  # Cylinder
+                obstacles_data.append({
+                    'type': 'cylinder',
+                    'center': [float(obs.center[0]), float(obs.center[1])],
+                    'radius': float(obs.radius),
+                    'z_min': float(obs.z_min),
+                    'z_max': float(obs.z_max)
+                })
+            elif hasattr(obs, 'polygon'):  # Prism
+                obstacles_data.append({
+                    'type': 'prism',
+                    'vertices': obs.polygon.vertices.tolist(),
+                    'z_min': float(obs.z_min),
+                    'z_max': float(obs.z_max)
+                })
+        
+        # 构建完整数据
+        data = {
+            'nodes': nodes_data,
+            'path': path_data,
+            'path_length': path_length,
+            'start': {
+                'x': float(self.map.start.x),
+                'y': float(self.map.start.y),
+                'z': float(self.map.start.z)
+            },
+            'goal': {
+                'x': float(self.map.target.position[0]),
+                'y': float(self.map.target.position[1]),
+                'z': float(self.map.target.position[2])
+            },
+            'obstacles': obstacles_data,
+            'config': {
+                'min_glide': float(self.min_glide),
+                'max_glide': float(self.max_glide),
+                'min_turn_radius': float(self.min_turn_radius),
+                'step_size': float(self.step_size)
+            }
+        }
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        
+        print(f"  数据已导出: {filepath}")
+        return filepath
+
     def _inject_spiral_descent(self, path: List[np.ndarray], goal: np.ndarray,
                                 goal_heading: float) -> List[np.ndarray]:
         """
@@ -948,6 +1048,9 @@ if __name__ == "__main__":
     planner = KinodynamicRRTStar(map_mgr)
     
     path, info = planner.plan(max_time=30.0)
+    
+    # 导出JSON（用于Web可视化）
+    planner.export_to_json(path=path, path_length=info.get('path_length'))
     
     # 可视化
     fig = plt.figure(figsize=(18, 6))

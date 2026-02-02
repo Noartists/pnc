@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RRT* 可视化</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            overflow: hidden;
+        }
+        #container {
+            width: 100vw;
+            height: 100vh;
+        }
+        #info-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            max-width: 300px;
+            font-size: 13px;
+        }
+        #info-panel h2 {
+            margin-bottom: 10px;
+            color: #4fc3f7;
+        }
+        #info-panel .stat {
+            margin: 5px 0;
+        }
+        #info-panel .stat label {
+            color: #888;
+        }
+        #controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+        }
+        #controls button {
+            display: block;
+            width: 100%;
+            margin: 5px 0;
+            padding: 8px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        #controls button.primary {
+            background: #4fc3f7;
+            color: #000;
+        }
+        #controls button.secondary {
+            background: #444;
+            color: #fff;
+        }
+        #controls button:hover {
+            opacity: 0.8;
+        }
+        #controls label {
+            display: block;
+            margin: 10px 0 5px;
+            color: #888;
+            font-size: 12px;
+        }
+        #controls input[type="checkbox"] {
+            margin-right: 8px;
+        }
+        #legend {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+        #legend .item {
+            display: flex;
+            align-items: center;
+            margin: 5px 0;
+        }
+        #legend .color-box {
+            width: 20px;
+            height: 10px;
+            margin-right: 10px;
+            border-radius: 2px;
+        }
+        #hover-info {
+            position: absolute;
+            display: none;
+            background: rgba(0,0,0,0.9);
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            pointer-events: none;
+            border: 1px solid #4fc3f7;
+        }
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 18px;
+            color: #4fc3f7;
+        }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+    
+    <div id="info-panel">
+        <h2>RRT* 规划结果</h2>
+        <div class="stat"><label>当前文件:</label> <span id="current-file" style="color:#4fc3f7;font-size:11px;">-</span></div>
+        <hr style="border-color:#444;margin:8px 0;">
+        <div class="stat"><label>节点数:</label> <span id="node-count">-</span></div>
+        <div class="stat"><label>路径点数:</label> <span id="path-count">-</span></div>
+        <div class="stat"><label>路径长度:</label> <span id="path-length">-</span></div>
+        <div class="stat"><label>起点:</label> <span id="start-pos">-</span></div>
+        <div class="stat"><label>终点:</label> <span id="goal-pos">-</span></div>
+        <div class="stat"><label>滑翔比范围:</label> <span id="glide-range">-</span></div>
+    </div>
+    
+    <div id="controls">
+        <label style="color:#888;font-size:12px;">选择数据文件:</label>
+        <select id="file-select" onchange="loadSelectedFile()" style="width:100%;margin:5px 0;padding:5px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;">
+            <option value="">-- 加载中 --</option>
+        </select>
+        <button class="primary" onclick="loadLatest()">加载最新</button>
+        <button class="secondary" onclick="refreshFileList()">刷新列表</button>
+        <button class="secondary" onclick="resetCamera()">重置视角</button>
+        <hr style="border-color:#444;margin:10px 0;">
+        <label>
+            <input type="checkbox" id="show-tree" checked onchange="toggleTree()">
+            显示RRT树
+        </label>
+        <label>
+            <input type="checkbox" id="show-path" checked onchange="togglePath()">
+            显示路径
+        </label>
+        <label>
+            <input type="checkbox" id="show-obstacles" checked onchange="toggleObstacles()">
+            显示障碍物
+        </label>
+        <label>
+            <input type="checkbox" id="color-by-height" checked onchange="updateNodeColors()">
+            按高度着色
+        </label>
+    </div>
+    
+    <div id="legend">
+        <div class="item">
+            <div class="color-box" style="background: #00ff00;"></div>
+            <span>起点</span>
+        </div>
+        <div class="item">
+            <div class="color-box" style="background: #ff0000;"></div>
+            <span>终点</span>
+        </div>
+        <div class="item">
+            <div class="color-box" style="background: linear-gradient(to right, #0000ff, #ff0000);"></div>
+            <span>节点高度 (低→高)</span>
+        </div>
+        <div class="item">
+            <div class="color-box" style="background: #ffff00;"></div>
+            <span>最终路径</span>
+        </div>
+        <div class="item">
+            <div class="color-box" style="background: #888888;"></div>
+            <span>障碍物</span>
+        </div>
+    </div>
+    
+    <div id="hover-info"></div>
+    <div id="loading" class="loading">加载中...</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
