@@ -31,6 +31,7 @@ from planning.global_planner import RRTStarPlanner
 from planning.path_smoother import PathSmoother
 from planning.trajectory import Trajectory, TrajectoryPoint
 from planning.kinodynamic_rrt import KinodynamicRRTStar
+from planning.trajectory_postprocess import TrajectoryPostprocessor
 from control.adrc_controller import ParafoilADRCController, ControlOutput
 from models.parafoil_model import ParafoilParams, parafoil_dynamics
 
@@ -231,45 +232,56 @@ class ClosedLoopSimulator:
         
         return True
     
-    def plan_kinodynamic(self, max_time: float = 30.0) -> bool:
+    def plan_kinodynamic(self, max_time: float = 30.0, smooth: bool = True) -> bool:
         """
         使用Kinodynamic RRT*规划路径
-        
+
         相比旧方法，这个方法：
         1. 在规划阶段就考虑滑翔比约束
         2. 生成的轨迹更符合翼伞物理特性
-        
+        3. 使用 TrajectoryPostprocessor 进行平滑处理
+
         参数:
             max_time: 最大规划时间 (s)
-        
+            smooth: 是否进行轨迹平滑（默认True）
+
         返回:
             是否成功
         """
         print("[3/4] 运行 Kinodynamic RRT* 路径规划...")
-        
+
         # 创建Kinodynamic RRT*规划器
         kino_planner = KinodynamicRRTStar(self.map_manager)
         path, info = kino_planner.plan(max_time=max_time)
-        
+
         if path is None:
             print("    路径规划失败!")
             return False
-        
+
         print(f"    规划完成: {len(path)} 航点")
         if 'path_length' in info:
             print(f"    路径长度: {info['path_length']:.1f}m")
-        
-        # 将路径转换为Trajectory对象
-        print("[4/4] 生成轨迹...")
-        self.trajectory = self._path_to_trajectory(path)
-        
-        print(f"    生成轨迹: {len(self.trajectory)} 点, 时长 {self.trajectory.duration:.1f}s")
-        
+
+        # 使用 TrajectoryPostprocessor 进行平滑处理
+        print("[4/4] 轨迹后处理（平滑 + 时间参数化）...")
+        postprocessor = TrajectoryPostprocessor(
+            reference_speed=self.reference_speed,
+            control_frequency=1.0 / self.control_dt,
+            min_turn_radius=self.map_manager.constraints.min_turn_radius
+        )
+
+        end_heading = self.map_manager.target.approach_heading if self.map_manager.target else None
+        self.trajectory = postprocessor.process(path, smooth=smooth, end_heading=end_heading)
+
+        if len(self.trajectory) == 0:
+            print("    轨迹生成失败!")
+            return False
+
         # 验证轨迹
         self._validate_trajectory_descent_rate()
-        
+
         self.controller.set_trajectory(self.trajectory)
-        
+
         return True
     
     def _path_to_trajectory(self, path: List[np.ndarray]) -> Trajectory:
@@ -783,8 +795,152 @@ class ClosedLoopSimulator:
         axes[1].grid(True, alpha=0.3)
         
         plt.tight_layout()
-        
+
         plt.show()
+
+    def export_to_json(self, output_path: str) -> str:
+        """
+        导出仿真数据到 JSON 文件（用于 Web 可视化）
+
+        参数:
+            output_path: 输出文件路径
+
+        返回:
+            实际保存的文件路径
+        """
+        import json
+        from datetime import datetime
+
+        if self.log is None or len(self.log.t) == 0:
+            print("没有仿真数据可导出")
+            return None
+
+        data = self.log.to_arrays()
+
+        # 构建导出数据
+        export_data = {
+            'type': 'closed_loop_simulation',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+
+            # 参考轨迹（平滑后的轨迹）
+            'reference_trajectory': [],
+
+            # 实际轨迹
+            'actual_trajectory': [],
+
+            # 控制数据
+            'control_data': [],
+
+            # 仿真信息
+            'info': {
+                'duration': float(data['t'][-1]),
+                'n_steps': len(data['t']),
+                'control_dt': self.control_dt,
+                'reference_speed': self.reference_speed,
+            }
+        }
+
+        # 添加起点终点
+        if self.map_manager.start:
+            export_data['start'] = {
+                'x': float(self.map_manager.start.x),
+                'y': float(self.map_manager.start.y),
+                'z': float(self.map_manager.start.z)
+            }
+        if self.map_manager.target:
+            export_data['goal'] = {
+                'x': float(self.map_manager.target.position[0]),
+                'y': float(self.map_manager.target.position[1]),
+                'z': float(self.map_manager.target.position[2])
+            }
+
+        # 添加障碍物
+        export_data['obstacles'] = []
+        for obs in self.map_manager.obstacles:
+            # 根据类名判断类型
+            obs_type = obs.__class__.__name__.lower()
+
+            if obs_type == 'cylinder':
+                obs_data = {
+                    'type': 'cylinder',
+                    'center': [float(obs.center[0]), float(obs.center[1])],
+                    'radius': float(obs.radius),
+                    'z_min': float(obs.z_min),
+                    'z_max': float(obs.z_max)
+                }
+            elif obs_type == 'prism':
+                # 计算多边形中心（顶点平均值）
+                verts = obs.polygon.vertices
+                center_x = float(np.mean([v[0] for v in verts]))
+                center_y = float(np.mean([v[1] for v in verts]))
+                obs_data = {
+                    'type': 'prism',
+                    'center': [center_x, center_y],
+                    'vertices': [[float(v[0]), float(v[1])] for v in verts],
+                    'z_min': float(obs.z_min),
+                    'z_max': float(obs.z_max)
+                }
+            else:
+                continue  # 跳过未知类型
+
+            export_data['obstacles'].append(obs_data)
+
+        # 参考轨迹（从 Trajectory 对象提取）
+        if self.trajectory:
+            for pt in self.trajectory.points:
+                export_data['reference_trajectory'].append({
+                    't': float(pt.t),
+                    'x': float(pt.position[0]),
+                    'y': float(pt.position[1]),
+                    'z': float(pt.position[2]),
+                    'heading': float(pt.heading),
+                    'curvature': float(pt.curvature)
+                })
+
+        # 实际轨迹和控制数据（降采样，避免文件过大）
+        # 每10步保存一次（100Hz -> 10Hz）
+        step = max(1, len(data['t']) // 1000)  # 最多1000个点
+
+        for i in range(0, len(data['t']), step):
+            # 实际轨迹
+            export_data['actual_trajectory'].append({
+                't': float(data['t'][i]),
+                'x': float(data['position'][i, 0]),
+                'y': float(data['position'][i, 1]),
+                'z': float(data['position'][i, 2]),
+                'vx': float(data['velocity'][i, 0]),
+                'vy': float(data['velocity'][i, 1]),
+                'vz': float(data['velocity'][i, 2]),
+                'roll': float(data['euler'][i, 0]),
+                'pitch': float(data['euler'][i, 1]),
+                'yaw': float(data['euler'][i, 2])
+            })
+
+            # 控制数据
+            export_data['control_data'].append({
+                't': float(data['t'][i]),
+                'delta_left': float(data['delta_left'][i]),
+                'delta_right': float(data['delta_right'][i]),
+                'cross_track_error': float(data['cross_track_error'][i]),
+                'heading_error': float(data['heading_error'][i]),
+                'glide_ratio_required': float(data['glide_ratio_required'][i]),
+                'glide_ratio_current': float(data['glide_ratio_current'][i])
+            })
+
+        # 确保输出目录存在
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        # 保存
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, indent=2)
+
+        print(f"\n仿真数据已导出到: {output_path}")
+        print(f"  参考轨迹: {len(export_data['reference_trajectory'])} 点")
+        print(f"  实际轨迹: {len(export_data['actual_trajectory'])} 点")
+
+        return output_path
 
 
 # ============================================================
@@ -793,7 +949,8 @@ class ClosedLoopSimulator:
 
 if __name__ == "__main__":
     import argparse
-    
+    from datetime import datetime
+
     parser = argparse.ArgumentParser(description="翼伞闭环仿真")
     parser.add_argument("--map-config", type=str, default="cfg/map_config.yaml",
                         help="地图配置文件")
@@ -812,8 +969,12 @@ if __name__ == "__main__":
     parser.add_argument("--planner", type=str, default="kinodynamic",
                         choices=["old", "kinodynamic"],
                         help="规划器类型: old=旧RRT*, kinodynamic=新Kinodynamic RRT*")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="输出目录（保存仿真数据 JSON，用于 Web 可视化），目录不存在会自动创建")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="不显示 matplotlib 图表")
     args = parser.parse_args()
-    
+
     # 创建仿真器
     sim = ClosedLoopSimulator(
         map_config_path=args.map_config,
@@ -821,24 +982,36 @@ if __name__ == "__main__":
         control_dt=args.control_dt,
         dynamics_dt=args.dynamics_dt
     )
-    
+
     # 规划
     if args.planner == "kinodynamic":
         success = sim.plan_kinodynamic(max_time=30.0)
     else:
         success = sim.plan(max_time=30.0)
-    
+
     if not success:
         exit(1)
-    
+
     # 初始化状态 (加一点初始偏差)
     sim.init_state(
         position_noise=args.position_noise,
         heading_noise=args.heading_noise
     )
-    
+
     # 运行仿真
     log = sim.run(max_time=args.max_time)
-    
+
+    # 导出数据到 JSON（用于 Web 可视化）
+    if args.output_dir:
+        # 确保输出目录存在
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir, exist_ok=True)
+            print(f"\n创建输出目录: {args.output_dir}")
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_path = os.path.join(args.output_dir, f'sim_{timestamp}.json')
+        sim.export_to_json(output_path)
+
     # 可视化
-    sim.visualize()
+    if not args.no_plot:
+        sim.visualize()
