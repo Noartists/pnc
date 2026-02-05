@@ -1,6 +1,7 @@
 # ==================== 数据文件夹 ====================
 trajectory_dataset/
 visualization/data/
+benchmark/outputs/
 
 # ==================== Python ====================
 __pycache__/

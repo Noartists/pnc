@@ -41,17 +41,20 @@ class TrajectoryPostprocessor:
     def __init__(self,
                  reference_speed: float = 12.0,
                  control_frequency: float = 100.0,
-                 min_turn_radius: float = 50.0):
+                 min_turn_radius: float = 50.0,
+                 quiet: bool = False):
         """
         参数:
             reference_speed: 参考飞行速度 (m/s)
             control_frequency: 控制频率 (Hz)
             min_turn_radius: 最小转弯半径 (m)，用于约束检查
+            quiet: 是否静默模式（不打印信息）
         """
         self.reference_speed = reference_speed
         self.control_frequency = control_frequency
         self.dt = 1.0 / control_frequency
         self.min_turn_radius = min_turn_radius
+        self.quiet = quiet
 
     def process(self,
                 path: List[np.ndarray],
@@ -69,7 +72,8 @@ class TrajectoryPostprocessor:
             Trajectory 对象
         """
         if not path or len(path) < 2:
-            print("    [后处理] 路径点太少，返回空轨迹")
+            if not self.quiet:
+                print("    [后处理] 路径点太少，返回空轨迹")
             return Trajectory(dt=self.dt)
 
         # 转换为numpy数组
@@ -78,24 +82,30 @@ class TrajectoryPostprocessor:
         # Step 1: 去除重复点
         waypoints = self._remove_duplicates(waypoints)
         if len(waypoints) < 2:
-            print("    [后处理] 去重后路径点太少")
+            if not self.quiet:
+                print("    [后处理] 去重后路径点太少")
             return Trajectory(dt=self.dt)
 
-        print(f"\n    [后处理] 输入: {len(path)} 个路径点")
+        if not self.quiet:
+            print(f"\n    [后处理] 输入: {len(path)} 个路径点")
 
         # Step 2: 平滑处理
         if smooth:
-            print(f"    [后处理] 执行三次样条平滑...")
+            if not self.quiet:
+                print(f"    [后处理] 执行三次样条平滑...")
             smooth_points = self._smooth_spline(waypoints)
-            print(f"    [后处理] 平滑后: {len(smooth_points)} 个点")
+            if not self.quiet:
+                print(f"    [后处理] 平滑后: {len(smooth_points)} 个点")
         else:
-            print(f"    [后处理] 跳过平滑，直接重采样...")
+            if not self.quiet:
+                print(f"    [后处理] 跳过平滑，直接重采样...")
             smooth_points = self._resample_linear(waypoints)
 
         # Step 3: 时间参数化，生成轨迹
         trajectory = self._create_trajectory(smooth_points, end_heading)
 
-        print(f"    [后处理] 生成轨迹: {len(trajectory)} 点, 时长 {trajectory.duration:.1f}s")
+        if not self.quiet:
+            print(f"    [后处理] 生成轨迹: {len(trajectory)} 点, 时长 {trajectory.duration:.1f}s")
 
         # Step 4: 验证轨迹约束
         self._validate_trajectory(trajectory)
@@ -152,7 +162,8 @@ class TrajectoryPostprocessor:
             cs_y = CubicSpline(s, ys, bc_type='natural')
             cs_z = CubicSpline(s, zs, bc_type='natural')
         except Exception as e:
-            print(f"    [后处理] 样条插值失败: {e}，使用线性插值")
+            if not self.quiet:
+                print(f"    [后处理] 样条插值失败: {e}，使用线性插值")
             return self._resample_linear(waypoints)
 
         # 计算采样点数（基于参考速度和控制频率）
@@ -338,14 +349,15 @@ class TrajectoryPostprocessor:
                     violations += 1
 
         # 打印统计
-        if glide_ratios:
-            print(f"    [验证] 滑翔比: [{min(glide_ratios):.2f}, {max(glide_ratios):.2f}], 均值={np.mean(glide_ratios):.2f}")
+        if not self.quiet:
+            if glide_ratios:
+                print(f"    [验证] 滑翔比: [{min(glide_ratios):.2f}, {max(glide_ratios):.2f}], 均值={np.mean(glide_ratios):.2f}")
 
-        if turn_radii:
-            min_r = min(turn_radii)
-            print(f"    [验证] 最小转弯半径: {min_r:.1f}m (约束: {self.min_turn_radius:.1f}m)")
-            if violations > 0:
-                print(f"    [警告] 有 {violations} 处转弯半径违反约束")
+            if turn_radii:
+                min_r = min(turn_radii)
+                print(f"    [验证] 最小转弯半径: {min_r:.1f}m (约束: {self.min_turn_radius:.1f}m)")
+                if violations > 0:
+                    print(f"    [警告] 有 {violations} 处转弯半径违反约束")
 
 
 def validate_trajectory(trajectory: Trajectory,
@@ -431,166 +443,44 @@ def validate_trajectory(trajectory: Trajectory,
     return result
 
 
-def save_smoothed_to_json(trajectory: Trajectory,
-                          json_path: str,
-                          update_existing: bool = True) -> str:
-    """
-    将平滑轨迹保存到 JSON 文件
-
-    参数:
-        trajectory: 平滑后的 Trajectory 对象
-        json_path: 原始 JSON 文件路径（或新文件路径）
-        update_existing: 是否更新现有文件（添加 smoothed_path 字段）
-
-    返回:
-        保存的文件路径
-    """
-    import json
-
-    # 提取平滑轨迹数据
-    smoothed_path = []
-    for pt in trajectory.points:
-        smoothed_path.append({
-            'x': float(pt.position[0]),
-            'y': float(pt.position[1]),
-            'z': float(pt.position[2]),
-            'heading': float(pt.heading),
-            'curvature': float(pt.curvature),
-            't': float(pt.t)
-        })
-
-    if update_existing and os.path.exists(json_path):
-        # 更新现有文件
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        data['smoothed_path'] = smoothed_path
-        data['smoothed_info'] = {
-            'n_points': len(trajectory),
-            'duration': trajectory.duration,
-            'total_length': trajectory.total_length
-        }
-
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
-
-        print(f"    已更新 {json_path}（添加 smoothed_path）")
-        return json_path
-    else:
-        # 创建新文件
-        output_path = json_path.replace('.json', '_smoothed.json')
-        data = {
-            'smoothed_path': smoothed_path,
-            'smoothed_info': {
-                'n_points': len(trajectory),
-                'duration': trajectory.duration,
-                'total_length': trajectory.total_length
-            }
-        }
-
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
-
-        print(f"    已保存到 {output_path}")
-        return output_path
-
-
-def load_path_from_json(json_path: str) -> Tuple[List[np.ndarray], dict]:
-    """
-    从 RRT 导出的 JSON 文件加载路径
-
-    参数:
-        json_path: JSON 文件路径
-
-    返回:
-        (path, config) - 路径点列表和配置参数
-    """
-    import json
-
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    # 提取路径点
-    path_data = data.get('path', [])
-    if not path_data:
-        raise ValueError(f"JSON 文件中没有 'path' 字段或路径为空: {json_path}")
-
-    path = [np.array(pt) for pt in path_data]
-
-    # 提取配置
-    config = data.get('config', {})
-    config['start'] = data.get('start', {})
-    config['goal'] = data.get('goal', {})
-
-    print(f"    从 {json_path} 加载路径: {len(path)} 个点")
-
-    return path, config
-
-
 # ============================================================
 #                     测试
 # ============================================================
 
 if __name__ == "__main__":
-    import argparse
+    from planning.kinodynamic_rrt import KinodynamicRRTStar
     from planning.map_manager import MapManager
     import matplotlib.pyplot as plt
-
-    parser = argparse.ArgumentParser(description="轨迹后处理测试")
-    parser.add_argument("--json", type=str, default=None,
-                        help="从 JSON 文件加载路径（如 visualization/data/rrt_data.json）")
-    parser.add_argument("--config", type=str, default="cfg/map_config.yaml",
-                        help="地图配置文件")
-    parser.add_argument("--no-smooth", action="store_true",
-                        help="不进行平滑处理")
-    parser.add_argument("--speed", type=float, default=12.0,
-                        help="参考速度 (m/s)")
-    parser.add_argument("--save", action="store_true",
-                        help="保存平滑轨迹到 JSON（用于 Web 可视化）")
-    parser.add_argument("--no-plot", action="store_true",
-                        help="不显示图表")
-    args = parser.parse_args()
 
     print("=" * 60)
     print("  轨迹后处理模块测试")
     print("=" * 60)
 
-    # 加载地图配置（获取约束参数）
-    print("\n[1/3] 加载配置...")
-    map_mgr = MapManager.from_yaml(args.config)
+    # 加载地图
+    print("\n[1/3] 加载地图...")
+    map_mgr = MapManager.from_yaml("cfg/map_config.yaml")
 
-    # 获取路径
-    if args.json:
-        # 方式1: 从 JSON 文件加载
-        print(f"\n[2/3] 从文件加载路径...")
-        path, json_config = load_path_from_json(args.json)
-        # 使用 JSON 中的配置（如果有）
-        min_turn_radius = json_config.get('min_turn_radius', map_mgr.constraints.min_turn_radius)
-    else:
-        # 方式2: 运行 Kinodynamic RRT*
-        print("\n[2/3] 运行 Kinodynamic RRT*...")
-        from planning.kinodynamic_rrt import KinodynamicRRTStar
-        planner = KinodynamicRRTStar(map_mgr)
-        path, info = planner.plan(max_time=30.0)
+    # 规划
+    print("\n[2/3] 运行 Kinodynamic RRT*...")
+    planner = KinodynamicRRTStar(map_mgr)
+    path, info = planner.plan(max_time=30.0)
 
-        if path is None:
-            print("规划失败!")
-            exit(1)
+    if path is None:
+        print("规划失败!")
+        exit(1)
 
-        print(f"    规划成功: {len(path)} 个路径点")
-        min_turn_radius = map_mgr.constraints.min_turn_radius
+    print(f"    规划成功: {len(path)} 个路径点")
 
     # 后处理
     print("\n[3/3] 轨迹后处理...")
     postprocessor = TrajectoryPostprocessor(
-        reference_speed=args.speed,
+        reference_speed=12.0,
         control_frequency=100.0,
-        min_turn_radius=min_turn_radius
+        min_turn_radius=map_mgr.constraints.min_turn_radius
     )
 
     end_heading = map_mgr.target.approach_heading if map_mgr.target else None
-    smooth = not args.no_smooth
-    trajectory = postprocessor.process(path, smooth=smooth, end_heading=end_heading)
+    trajectory = postprocessor.process(path, smooth=True, end_heading=end_heading)
 
     # 验证
     print("\n[验证结果]")
@@ -598,7 +488,7 @@ if __name__ == "__main__":
         trajectory,
         min_glide_ratio=map_mgr.constraints.min_glide_ratio,
         max_glide_ratio=map_mgr.constraints.glide_ratio,
-        min_turn_radius=min_turn_radius
+        min_turn_radius=map_mgr.constraints.min_turn_radius
     )
     print(f"  有效: {result['valid']}")
     if result['errors']:
@@ -606,61 +496,48 @@ if __name__ == "__main__":
     if result['warnings']:
         print(f"  警告数: {len(result['warnings'])}")
 
-    # 保存到 JSON（用于 Web 可视化）
-    if args.save and args.json:
-        print("\n[保存平滑轨迹]")
-        save_smoothed_to_json(trajectory, args.json, update_existing=True)
-    elif args.save:
-        print("\n[保存平滑轨迹]")
-        output_path = "visualization/data/rrt_data.json"
-        if os.path.exists(output_path):
-            save_smoothed_to_json(trajectory, output_path, update_existing=True)
-        else:
-            print(f"    警告: {output_path} 不存在，跳过保存")
-
     # 可视化
-    if not args.no_plot:
-        print("\n[可视化]")
-        path_arr = np.array(path)
-        traj_arr = trajectory.to_position_array()
+    print("\n[可视化]")
+    path_arr = np.array(path)
+    traj_arr = trajectory.to_position_array()
 
-        fig = plt.figure(figsize=(15, 5))
+    fig = plt.figure(figsize=(15, 5))
 
-        # 3D对比
-        ax1 = fig.add_subplot(131, projection='3d')
-        ax1.plot(path_arr[:, 0], path_arr[:, 1], path_arr[:, 2],
-                 'r.--', markersize=4, linewidth=1, alpha=0.7, label='RRT* 原始')
-        ax1.plot(traj_arr[:, 0], traj_arr[:, 1], traj_arr[:, 2],
-                 'b-', linewidth=1.5, alpha=0.9, label='平滑后')
-        ax1.set_xlabel('X (m)')
-        ax1.set_ylabel('Y (m)')
-        ax1.set_zlabel('Z (m)')
-        ax1.legend()
-        ax1.set_title('3D 轨迹对比')
+    # 3D对比
+    ax1 = fig.add_subplot(131, projection='3d')
+    ax1.plot(path_arr[:, 0], path_arr[:, 1], path_arr[:, 2],
+             'r.--', markersize=4, linewidth=1, alpha=0.7, label='RRT* 原始')
+    ax1.plot(traj_arr[:, 0], traj_arr[:, 1], traj_arr[:, 2],
+             'b-', linewidth=1.5, alpha=0.9, label='平滑后')
+    ax1.set_xlabel('X (m)')
+    ax1.set_ylabel('Y (m)')
+    ax1.set_zlabel('Z (m)')
+    ax1.legend()
+    ax1.set_title('3D 轨迹对比')
 
-        # XY平面
-        ax2 = fig.add_subplot(132)
-        ax2.plot(path_arr[:, 0], path_arr[:, 1], 'r.--',
-                 markersize=6, linewidth=1, alpha=0.7, label='RRT* 原始')
-        ax2.plot(traj_arr[:, 0], traj_arr[:, 1], 'b-',
-                 linewidth=2, alpha=0.9, label='平滑后')
-        ax2.set_xlabel('X (m)')
-        ax2.set_ylabel('Y (m)')
-        ax2.legend()
-        ax2.axis('equal')
-        ax2.grid(True, alpha=0.3)
-        ax2.set_title('XY 平面')
+    # XY平面
+    ax2 = fig.add_subplot(132)
+    ax2.plot(path_arr[:, 0], path_arr[:, 1], 'r.--',
+             markersize=6, linewidth=1, alpha=0.7, label='RRT* 原始')
+    ax2.plot(traj_arr[:, 0], traj_arr[:, 1], 'b-',
+             linewidth=2, alpha=0.9, label='平滑后')
+    ax2.set_xlabel('X (m)')
+    ax2.set_ylabel('Y (m)')
+    ax2.legend()
+    ax2.axis('equal')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_title('XY 平面')
 
-        # 高度剖面
-        ax3 = fig.add_subplot(133)
-        timestamps = trajectory.get_timestamps()
-        ax3.plot(timestamps, traj_arr[:, 2], 'b-', linewidth=2)
-        ax3.set_xlabel('Time (s)')
-        ax3.set_ylabel('Altitude (m)')
-        ax3.grid(True, alpha=0.3)
-        ax3.set_title('高度剖面')
+    # 高度剖面
+    ax3 = fig.add_subplot(133)
+    timestamps = trajectory.get_timestamps()
+    ax3.plot(timestamps, traj_arr[:, 2], 'b-', linewidth=2)
+    ax3.set_xlabel('Time (s)')
+    ax3.set_ylabel('Altitude (m)')
+    ax3.grid(True, alpha=0.3)
+    ax3.set_title('高度剖面')
 
-        plt.tight_layout()
-        plt.show()
+    plt.tight_layout()
+    plt.show()
 
     print("\n测试完成!")

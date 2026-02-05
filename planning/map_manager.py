@@ -289,14 +289,45 @@ class MapManager:
         self.corridor: Optional[Polygon] = None
         self.corridor_z_range: Tuple[float, float] = (0, np.inf)
         self.constraints = Constraints()
+        # 外部传入的 RNG（用于 benchmark 可复现性）
+        self._rng = None
+        # 静默模式
+        self._quiet = False
+    
+    def _rand_uniform(self, low: float, high: float) -> float:
+        """统一的随机数生成（支持外部 RNG）"""
+        if self._rng is not None:
+            return self._rng.uniform(low, high)
+        return np.random.uniform(low, high)
+    
+    def _rand_int(self, low: int, high: int) -> int:
+        """统一的随机整数生成（支持外部 RNG）"""
+        if self._rng is not None:
+            return self._rng.integers(low, high)
+        return np.random.randint(low, high)
+    
+    def _rand_choice(self, a, size=None, replace=True, p=None):
+        """统一的随机选择（支持外部 RNG）"""
+        if self._rng is not None:
+            return self._rng.choice(a, size=size, replace=replace, p=p)
+        return np.random.choice(a, size=size, replace=replace, p=p)
 
     @classmethod
-    def from_yaml(cls, yaml_path: str) -> 'MapManager':
-        """从YAML文件加载地图"""
+    def from_yaml(cls, yaml_path: str, rng=None, quiet: bool = False) -> 'MapManager':
+        """
+        从YAML文件加载地图
+        
+        参数:
+            yaml_path: YAML配置文件路径
+            rng: 可选的 numpy.random.Generator，用于 benchmark 的可复现随机化
+                 如果提供了 rng，则忽略配置文件中的 seed
+            quiet: 静默模式（不打印详细信息）
+        """
         with open(yaml_path, 'r', encoding='utf-8') as f:
             cfg = yaml.safe_load(f)
 
         manager = cls()
+        manager._quiet = quiet
 
         # 边界
         if 'bounds' in cfg:
@@ -356,9 +387,17 @@ class MapManager:
         # 随机化
         if 'randomization' in cfg and cfg['randomization'].get('enabled', False):
             r = cfg['randomization']
-            seed = r.get('seed', None)
-            if seed is not None:
-                np.random.seed(seed)
+            
+            # 如果外部传入了 rng，则使用它；否则使用配置文件中的 seed
+            if rng is not None:
+                # 使用外部传入的 RNG（benchmark 模式）
+                manager._rng = rng
+            else:
+                # 使用配置文件中的 seed
+                seed = r.get('seed', None)
+                if seed is not None:
+                    np.random.seed(seed)
+                manager._rng = None
 
             # 随机化起点终点
             if r.get('randomize_endpoints', False):
@@ -397,10 +436,10 @@ class MapManager:
         if 'target' in cfg and 'random' in cfg['target']:
             t = cfg['target']
             r = t['random']
-            target_x = np.random.uniform(*r['x_range'])
-            target_y = np.random.uniform(*r['y_range'])
+            target_x = self._rand_uniform(*r['x_range'])
+            target_y = self._rand_uniform(*r['y_range'])
             target_z = r.get('z', 0)  # 地面高度固定
-            desired_heading = np.random.uniform(0, 2 * np.pi)
+            desired_heading = self._rand_uniform(0, 2 * np.pi)
 
             # 兼容新旧配置格式
             max_length = t.get('max_approach_length', t.get('approach_length', 200))
@@ -415,7 +454,8 @@ class MapManager:
                 min_approach_length=min_length,
                 approach_heading_tolerance=np.radians(heading_tolerance)
             )
-            print(f"随机终点: ({target_x:.0f}, {target_y:.0f}, {target_z:.0f})")
+            if not self._quiet:
+                print(f"随机终点: ({target_x:.0f}, {target_y:.0f}, {target_z:.0f})")
         elif self.target is not None:
             target_x, target_y, target_z = self.target.position
         
@@ -427,8 +467,8 @@ class MapManager:
             max_attempts = 100
             for attempt in range(max_attempts):
                 # 随机 XY
-                start_x = np.random.uniform(*r['x_range'])
-                start_y = np.random.uniform(*r['y_range'])
+                start_x = self._rand_uniform(*r['x_range'])
+                start_y = self._rand_uniform(*r['y_range'])
                 
                 # 计算水平距离
                 horizontal_dist = np.sqrt((start_x - target_x)**2 + (start_y - target_y)**2)
@@ -444,29 +484,31 @@ class MapManager:
                 
                 if z_min <= z_max:
                     # 可达，生成起点
-                    start_z = np.random.uniform(z_min, z_max)
-                    heading = np.random.uniform(0, 2 * np.pi)
+                    start_z = self._rand_uniform(z_min, z_max)
+                    heading = self._rand_uniform(0, 2 * np.pi)
                     self.start = Waypoint(start_x, start_y, start_z, heading)
                     
                     excess_altitude = start_z - (horizontal_dist / glide_ratio + target_z)
-                    print(f"随机起点: ({start_x:.0f}, {start_y:.0f}, {start_z:.0f})")
-                    print(f"  水平距离: {horizontal_dist:.0f}m, 需要最小高度: {min_altitude_required:.0f}m")
-                    print(f"  高度盈余: {excess_altitude:.0f}m (可用于路径绕行/消高)")
+                    if not self._quiet:
+                        print(f"随机起点: ({start_x:.0f}, {start_y:.0f}, {start_z:.0f})")
+                        print(f"  水平距离: {horizontal_dist:.0f}m, 需要最小高度: {min_altitude_required:.0f}m")
+                        print(f"  高度盈余: {excess_altitude:.0f}m (可用于路径绕行/消高)")
                     return
                 
                 # 当前 XY 无法满足可达性，重试
                 if attempt == max_attempts - 1:
                     # 最后尝试：强制使用最大高度
                     start_z = z_range[1]
-                    heading = np.random.uniform(0, 2 * np.pi)
+                    heading = self._rand_uniform(0, 2 * np.pi)
                     self.start = Waypoint(start_x, start_y, start_z, heading)
                     
-                    print(f"[警告] 可达性受限，使用最大高度")
-                    print(f"随机起点: ({start_x:.0f}, {start_y:.0f}, {start_z:.0f})")
-                    print(f"  水平距离: {horizontal_dist:.0f}m, 需要最小高度: {min_altitude_required:.0f}m")
-                    
-                    if start_z < min_altitude_required:
-                        print(f"  [警告] 高度不足! 差 {min_altitude_required - start_z:.0f}m")
+                    if not self._quiet:
+                        print(f"[警告] 可达性受限，使用最大高度")
+                        print(f"随机起点: ({start_x:.0f}, {start_y:.0f}, {start_z:.0f})")
+                        print(f"  水平距离: {horizontal_dist:.0f}m, 需要最小高度: {min_altitude_required:.0f}m")
+                        
+                        if start_z < min_altitude_required:
+                            print(f"  [警告] 高度不足! 差 {min_altitude_required - start_z:.0f}m")
                     return
 
     def check_reachability(self, path_factor: float = 1.3) -> dict:
@@ -532,8 +574,11 @@ class MapManager:
         return result
     
     def print_reachability_report(self):
-        """打印可达性报告"""
+        """打印可达性报告（静默模式下只返回结果不打印）"""
         r = self.check_reachability()
+        
+        if self._quiet:
+            return r
         
         print("\n" + "=" * 50)
         print("  可达性分析报告")
@@ -638,18 +683,18 @@ class MapManager:
                 break
 
             # 决定是在飞行区域内还是区域外生成
-            in_flight_zone = np.random.random() < flight_zone_ratio
+            in_flight_zone = self._rand_uniform(0, 1) < flight_zone_ratio
 
             if in_flight_zone:
                 # 在飞行区域内生成 (沿飞行路径的椭圆区域)
-                t = np.random.uniform(-0.6, 1.1)  # 沿飞行方向的位置
-                s = np.random.uniform(-0.4, 0.4)  # 垂直于飞行方向的偏移
+                t = self._rand_uniform(-0.6, 1.1)  # 沿飞行方向的位置
+                s = self._rand_uniform(-0.4, 0.4)  # 垂直于飞行方向的偏移
                 cx = flight_center[0] + t * flight_length * flight_dir[0] + s * flight_length * flight_perp[0]
                 cy = flight_center[1] + t * flight_length * flight_dir[1] + s * flight_length * flight_perp[1]
             else:
                 # 在整个区域内随机生成
-                cx = np.random.uniform(x_min, x_max)
-                cy = np.random.uniform(y_min, y_max)
+                cx = self._rand_uniform(x_min, x_max)
+                cy = self._rand_uniform(y_min, y_max)
 
             # 确保在边界内
             cx = np.clip(cx, x_min, x_max)
@@ -657,8 +702,8 @@ class MapManager:
             center = np.array([cx, cy])
 
             # 随机尺寸和高度
-            size = np.random.uniform(*radius_range)
-            height = np.random.uniform(*height_range)
+            size = self._rand_uniform(*radius_range)
+            height = self._rand_uniform(*height_range)
 
             # 检查是否与起点/目标太近
             if start_pos is not None:
@@ -684,7 +729,7 @@ class MapManager:
 
             # 随机选择障碍物类型 (40% 圆柱, 60% 多边形)
             name = f"建筑{generated + 1}"
-            obs_type = np.random.choice(['cylinder', 'polygon'], p=[0.4, 0.6])
+            obs_type = self._rand_choice(['cylinder', 'polygon'], p=[0.4, 0.6])
 
             if obs_type == 'cylinder':
                 obs = Cylinder(center, size, 0, height, name)
@@ -696,18 +741,19 @@ class MapManager:
             self.obstacles.append(obs)
             generated += 1
 
-        print(f"随机生成了 {generated} 个障碍物")
+        if not self._quiet:
+            print(f"随机生成了 {generated} 个障碍物")
 
     def _generate_random_polygon(self, center: np.ndarray, size: float) -> np.ndarray:
         """生成随机多边形顶点"""
         # 随机选择形状类型
-        shape_type = np.random.choice(['rectangle', 'l_shape', 'random'])
+        shape_type = self._rand_choice(['rectangle', 'l_shape', 'random'])
 
         if shape_type == 'rectangle':
             # 随机矩形
-            w = size * np.random.uniform(0.6, 1.4)
-            h = size * np.random.uniform(0.6, 1.4)
-            angle = np.random.uniform(0, np.pi / 2)
+            w = size * self._rand_uniform(0.6, 1.4)
+            h = size * self._rand_uniform(0.6, 1.4)
+            angle = self._rand_uniform(0, np.pi / 2)
             corners = np.array([[-w/2, -h/2], [w/2, -h/2], [w/2, h/2], [-w/2, h/2]])
             # 旋转
             rot = np.array([[np.cos(angle), -np.sin(angle)],
@@ -716,25 +762,25 @@ class MapManager:
 
         elif shape_type == 'l_shape':
             # L形建筑
-            w = size * np.random.uniform(0.8, 1.2)
-            h = size * np.random.uniform(0.8, 1.2)
-            cut = np.random.uniform(0.3, 0.5)
+            w = size * self._rand_uniform(0.8, 1.2)
+            h = size * self._rand_uniform(0.8, 1.2)
+            cut = self._rand_uniform(0.3, 0.5)
             vertices = np.array([
                 [0, 0], [w, 0], [w, h * cut],
                 [w * cut, h * cut], [w * cut, h], [0, h]
             ])
             vertices = vertices - np.array([w/2, h/2]) + center
             # 随机旋转
-            angle = np.random.choice([0, np.pi/2, np.pi, 3*np.pi/2])
+            angle = self._rand_choice([0, np.pi/2, np.pi, 3*np.pi/2])
             rot = np.array([[np.cos(angle), -np.sin(angle)],
                            [np.sin(angle), np.cos(angle)]])
             vertices = (rot @ (vertices - center).T).T + center
 
         else:
             # 随机凸多边形
-            n_vertices = np.random.randint(4, 7)
-            angles = np.sort(np.random.uniform(0, 2 * np.pi, n_vertices))
-            radii = size * np.random.uniform(0.5, 1.0, n_vertices)
+            n_vertices = self._rand_int(4, 7)
+            angles = np.sort(np.array([self._rand_uniform(0, 2 * np.pi) for _ in range(n_vertices)]))
+            radii = np.array([size * self._rand_uniform(0.5, 1.0) for _ in range(n_vertices)])
             vertices = np.column_stack([
                 center[0] + radii * np.cos(angles),
                 center[1] + radii * np.sin(angles)
@@ -896,7 +942,8 @@ class MapManager:
             (approach_point, actual_heading, actual_length) 或 (None, 0, 0)
         """
         if self.target is None:
-            print("    [警告] 未定义目标，无法查找进场点")
+            if not self._quiet:
+                print("    [警告] 未定义目标，无法查找进场点")
             return None, 0.0, 0.0
 
         # 使用target配置作为默认值
@@ -909,9 +956,10 @@ class MapManager:
         if heading_tolerance is None:
             heading_tolerance = self.target.approach_heading_tolerance
 
-        print(f"    [进场点搜索] 期望航向={np.degrees(desired_heading):.1f}°, "
-              f"长度范围=[{min_length:.0f}, {max_length:.0f}]m, "
-              f"容差=±{np.degrees(heading_tolerance):.1f}°")
+        if not self._quiet:
+            print(f"    [进场点搜索] 期望航向={np.degrees(desired_heading):.1f}°, "
+                  f"长度范围=[{min_length:.0f}, {max_length:.0f}]m, "
+                  f"容差=±{np.degrees(heading_tolerance):.1f}°")
 
         # 定义采样长度序列（从长到短，优先选择长的）
         length_samples = []
@@ -955,9 +1003,10 @@ class MapManager:
                         best_approach = candidate
                         best_heading = test_heading
                         best_length = length
-                        print(f"    [进场点搜索] 找到安全进场点: "
-                              f"航向={np.degrees(test_heading):.1f}° (偏移{np.degrees(heading_offset):.1f}°), "
-                              f"长度={length:.0f}m")
+                        if not self._quiet:
+                            print(f"    [进场点搜索] 找到安全进场点: "
+                                  f"航向={np.degrees(test_heading):.1f}° (偏移{np.degrees(heading_offset):.1f}°), "
+                                  f"长度={length:.0f}m")
                     # 由于从长到短搜索，找到就可以跳过后续更短的
                     break
 
@@ -966,11 +1015,13 @@ class MapManager:
                 break
 
         if best_approach is not None:
-            print(f"    [进场点搜索] ✓ 最终选择: "
-                  f"航向={np.degrees(best_heading):.1f}°, 长度={best_length:.0f}m")
+            if not self._quiet:
+                print(f"    [进场点搜索] ✓ 最终选择: "
+                      f"航向={np.degrees(best_heading):.1f}°, 长度={best_length:.0f}m")
             return best_approach, best_heading, best_length
         else:
-            print(f"    [进场点搜索] ✗ 未找到安全进场点！")
+            if not self._quiet:
+                print(f"    [进场点搜索] ✗ 未找到安全进场点！")
             return None, 0.0, 0.0
 
     # -------- 可视化数据 --------

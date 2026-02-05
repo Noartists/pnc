@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RRT*/仿真 可视化</title>
+    <title>RRT*/仿真/Benchmark 可视化</title>
     <style>
         * {
             margin: 0;
@@ -47,7 +47,7 @@
             background: rgba(0,0,0,0.8);
             padding: 15px;
             border-radius: 8px;
-            max-width: 220px;
+            max-width: 250px;
         }
         #controls button {
             display: block;
@@ -66,6 +66,10 @@
         #controls button.secondary {
             background: #444;
             color: #fff;
+        }
+        #controls button.benchmark {
+            background: #ff9800;
+            color: #000;
         }
         #controls button:hover {
             opacity: 0.8;
@@ -91,6 +95,101 @@
             color: #fff;
             border: 1px solid #555;
             border-radius: 4px;
+        }
+
+        /* Benchmark 面板 */
+        #benchmark-panel {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.95);
+            padding: 20px;
+            border-radius: 12px;
+            max-width: 700px;
+            max-height: 80vh;
+            overflow-y: auto;
+            display: none;
+            z-index: 100;
+            border: 1px solid #4fc3f7;
+        }
+        #benchmark-panel.visible {
+            display: block;
+        }
+        #benchmark-panel h2 {
+            color: #ff9800;
+            margin-bottom: 15px;
+        }
+        #benchmark-panel .close-btn {
+            position: absolute;
+            top: 10px;
+            right: 15px;
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 24px;
+            cursor: pointer;
+        }
+        #benchmark-panel .close-btn:hover {
+            color: #fff;
+        }
+        .exp-card {
+            background: #222;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+        }
+        .exp-card h3 {
+            color: #4fc3f7;
+            margin-bottom: 10px;
+        }
+        .scene-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .scene-badge {
+            background: #333;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .scene-badge:hover {
+            background: #444;
+        }
+        .scene-badge .success-rate {
+            color: #4caf50;
+            font-weight: bold;
+        }
+        .seed-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(60px, 1fr));
+            gap: 5px;
+            margin-top: 10px;
+        }
+        .seed-btn {
+            padding: 8px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            text-align: center;
+        }
+        .seed-btn.success {
+            background: #2e7d32;
+            color: #fff;
+        }
+        .seed-btn.failed {
+            background: #c62828;
+            color: #fff;
+        }
+        .seed-btn.unknown {
+            background: #555;
+            color: #fff;
+        }
+        .seed-btn:hover {
+            opacity: 0.8;
         }
 
         /* 播放控件 */
@@ -214,6 +313,10 @@
             background: #4caf50;
             color: #fff;
         }
+        .badge-benchmark {
+            background: #9c27b0;
+            color: #fff;
+        }
     </style>
 </head>
 <body>
@@ -241,12 +344,15 @@
     </div>
 
     <div id="controls">
-        <label style="color:#888;font-size:12px;">选择数据文件:</label>
+        <label style="color:#888;font-size:12px;">数据文件:</label>
         <select id="file-select" onchange="loadSelectedFile()">
             <option value="">-- 加载中 --</option>
         </select>
         <button class="primary" onclick="loadLatest()">加载最新</button>
         <button class="secondary" onclick="refreshFileList()">刷新列表</button>
+        <hr style="border-color:#444;margin:10px 0;">
+        <button class="benchmark" onclick="openBenchmarkPanel()">📊 浏览 Benchmark</button>
+        <hr style="border-color:#444;margin:10px 0;">
         <button class="secondary" onclick="resetCamera()">重置视角</button>
         <hr style="border-color:#444;margin:10px 0;">
         <label>
@@ -273,6 +379,15 @@
             <input type="checkbox" id="color-by-height" checked onchange="updateNodeColors()">
             按高度着色
         </label>
+    </div>
+
+    <!-- Benchmark 面板 -->
+    <div id="benchmark-panel">
+        <button class="close-btn" onclick="closeBenchmarkPanel()">×</button>
+        <h2>📊 Benchmark 结果浏览</h2>
+        <div id="benchmark-content">
+            <p style="color:#888;">加载中...</p>
+        </div>
     </div>
 
     <!-- 播放控件 -->

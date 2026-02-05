@@ -2,11 +2,23 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-翼伞无人机路径规划与控制项目，包含动力学建模、全局路径规划、轨迹平滑、ADRC控制器、闭环仿真和Web可视化模块。
+翼伞无人机路径规划与控制项目，包含动力学建模、Kinodynamic RRT* 路径规划、轨迹平滑、ADRC 控制器、闭环仿真、Benchmark 测试框架和 Web 可视化模块。
 
-> **维护者**: [张驰]  
-> **联系方式**: [zhangchi9900@gmail.com]  
-> **实验室**: [南开大学智能预测自适应实验室]
+> **维护者**: 张驰  
+> **联系方式**: zhangchi9900@gmail.com  
+> **实验室**: 南开大学智能预测自适应实验室
+
+---
+
+## 目录
+
+- [项目结构](#项目结构)
+- [快速开始](#快速开始)
+- [Benchmark 测试框架](#benchmark-测试框架)
+- [Web 可视化](#web-可视化)
+- [命令行参数速查](#命令行参数速查)
+- [模块详细说明](#模块详细说明)
+- [代码调用示例](#代码调用示例)
 
 ---
 
@@ -16,37 +28,36 @@
 pnc/
 ├── cfg/                           # 配置文件
 │   ├── config.yaml                # 翼伞动力学模型参数
-│   └── map_config.yaml            # 地图与任务配置
+│   └── map_config.yaml            # 地图与任务配置（支持场景随机化）
 │
 ├── models/                        # 动力学模型
 │   └── parafoil_model.py          # 8自由度翼伞模型
 │
 ├── planning/                      # 规划模块
-│   ├── __init__.py                # 模块导出
-│   ├── map_manager.py             # 地图管理器 (障碍物、约束)
-│   ├── global_planner.py          # RRT* 全局规划 (旧版)
-│   ├── kinodynamic_rrt.py         # ★ Kinodynamic RRT* (新版，含Dubins曲线)
-│   ├── path_smoother.py           # 路径平滑器 (样条/Dubins)
-│   ├── trajectory_postprocess.py  # 轨迹后处理
+│   ├── map_manager.py             # 地图管理器（障碍物、约束、可达性分析）
+│   ├── kinodynamic_rrt.py         # ★ Kinodynamic RRT*（Dubins曲线 + 滑翔比约束）
+│   ├── trajectory_postprocess.py  # 轨迹后处理（平滑、螺旋消高、时间参数化）
 │   └── trajectory.py              # 轨迹数据结构
 │
 ├── control/                       # 控制模块
-│   ├── __init__.py                # 模块导出
 │   └── adrc_controller.py         # ADRC 航向/横向控制器
 │
 ├── simulation/                    # 仿真模块
-│   ├── __init__.py                # 模块导出
-│   ├── closed_loop_sim.py         # 闭环仿真 (规划+控制+动力学)
+│   ├── closed_loop_sim.py         # ★ 闭环仿真（规划+控制+动力学）
 │   └── open_loop_test.py          # 开环动力学测试
 │
-└── visualization/                 # ★ Web可视化模块
-    ├── server.py                  # Flask服务器 (端口8080)
-    ├── templates/
-    │   └── index.html             # Web前端页面
-    ├── static/js/
-    │   └── app.js                 # Three.js 3D渲染
-    └── data/                      # RRT数据文件 (自动生成)
-        └── rrt_YYYYMMDD_HHMMSS_*.json
+├── benchmark/                     # ★ Benchmark 测试框架
+│   ├── runner.py                  # Benchmark 运行器（批量测试）
+│   ├── metrics.py                 # 失败检测与质量指标计算
+│   ├── outputs.py                 # 结果导出（metrics.json, case.json）
+│   ├── rng_manager.py             # 随机数管理（可复现性）
+│   └── outputs/                   # 测试结果输出目录
+│       └── exp_YYYYMMDD_HHMMSS/   # 每次实验的结果
+│
+└── visualization/                 # Web 可视化模块
+    ├── server.py                  # Flask 服务器
+    ├── templates/index.html       # 前端页面
+    └── static/js/app.js           # Three.js 3D 渲染
 ```
 
 ---
@@ -59,133 +70,194 @@ pnc/
 pip install numpy scipy matplotlib pyyaml flask tqdm
 ```
 
-### 2. 运行闭环仿真
+### 2. 运行单次闭环仿真
 
 ```bash
-# 使用新的Kinodynamic RRT*规划器（默认）
+# 基本运行（自动规划 + 控制 + 可视化）
 python simulation/closed_loop_sim.py
 
-# 使用旧的RRT*规划器
-python simulation/closed_loop_sim.py --planner=old
+# 指定随机种子（可复现）
+python simulation/closed_loop_sim.py --seed=42
 
-# 自定义参数
-python simulation/closed_loop_sim.py --max-time=300 --control-dt=0.01
+# 导出仿真数据
+python simulation/closed_loop_sim.py --output-dir=results/
 ```
 
-### 3. 单独运行规划器并查看可视化
+### 3. 运行 Benchmark 批量测试
 
 ```bash
-# 步骤1: 运行规划器（自动导出JSON数据）
-python planning/kinodynamic_rrt.py
+# 运行 10 个随机种子
+python -m benchmark.runner --seeds 10
 
-# 步骤2: 启动Web可视化服务器
+# 运行指定范围
+python -m benchmark.runner --seeds 1-50
+
+# 继续之前中断的测试
+python -m benchmark.runner --seeds 100 --resume
+```
+
+### 4. 启动 Web 可视化
+
+```bash
+# 启动服务器
 python visualization/server.py --port=8080
 
-# 步骤3: 浏览器访问
+# 浏览器访问
 # http://127.0.0.1:8080
 ```
 
 ---
 
+## Benchmark 测试框架
+
+Benchmark 模块用于批量测试闭环系统性能，支持：
+
+- **批量运行**：指定种子数量或范围，自动运行多次仿真
+- **进度显示**：实时显示规划/仿真进度和成功率统计
+- **结果导出**：每个种子生成 `metrics.json` 和 `case.json`
+- **汇总报告**：生成 `summary.csv` 和终端统计报告
+- **可复现性**：基于 `SeedSequence` 的随机数管理
+
+### 使用方法
+
+```bash
+# 基本用法
+python -m benchmark.runner --seeds 100
+
+# 指定场景和配置
+python -m benchmark.runner --seeds 50 --scene my_scene --map-config cfg/my_map.yaml
+
+# 显示详细输出
+python -m benchmark.runner --seeds 10 -v
+```
+
+### 输出结构
+
+```
+benchmark/outputs/
+└── exp_20260206_143025/          # 实验目录（按时间戳命名）
+    └── default/                   # 场景名称
+        ├── summary.csv            # 汇总表（所有种子的指标）
+        ├── seed_001/
+        │   ├── metrics.json       # 关键指标（成功/失败、误差、耗时）
+        │   └── case.json          # 完整数据（轨迹、控制量、配置）
+        ├── seed_002/
+        │   └── ...
+        └── ...
+```
+
+### 评估指标
+
+| 类别 | 指标 | 说明 |
+|------|------|------|
+| **成功判定** | `landing_error` | 落点误差 < 20m 为成功 |
+| **质量指标** | `ADE` | 平均跟踪误差 (m) |
+| | `FDE` | 终点偏差 (m) |
+| | `control_effort` | 控制量积分 |
+| **失败原因** | `hard_*` | 硬失败（禁飞区、姿态超限、数值爆炸） |
+| | `soft_*` | 软失败（跟踪发散、长时间饱和、超时） |
+
+### 进度条说明
+
+运行时会显示实时进度：
+
+```
+Seed 042 [仿真 45.2%]: 100%|████████████| 50/50 [08:32<00:00] Plan:48✓/2✗ Ctrl:35✓/13✗
+```
+
+- `Seed 042 [仿真 45.2%]`：当前种子和阶段进度
+- `50/50`：已完成/总数
+- `Plan:48✓/2✗`：规划成功 48 次，失败 2 次
+- `Ctrl:35✓/13✗`：控制成功 35 次，失败 13 次
+
+---
+
+## Web 可视化
+
+基于 Three.js 的 3D 可视化界面，支持：
+
+- 查看 RRT 树节点（按高度着色）
+- 查看规划路径和实际轨迹
+- 查看禁飞区和走廊
+- 浏览 Benchmark 历史结果
+- 鼠标交互（左键旋转、右键平移、滚轮缩放）
+
+### 启动方法
+
+```bash
+python visualization/server.py --port=8080 --host=127.0.0.1
+```
+
+### 功能
+
+1. **加载规划数据**：从 `visualization/data/` 加载 RRT 规划结果
+2. **加载仿真数据**：从 `visualization/data/` 加载闭环仿真结果
+3. **浏览 Benchmark**：从 `benchmark/outputs/` 浏览历史测试结果
+
+---
+
 ## 命令行参数速查
 
-### `simulation/closed_loop_sim.py` - 闭环仿真
+### `python -m benchmark.runner` - Benchmark 运行器
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--seeds` | `10` | 种子数量或范围，如 `100`、`1-50`、`1,5,10` |
+| `--scene` | `default` | 场景名称 |
+| `--map-config` | `cfg/map_config.yaml` | 地图配置文件 |
+| `--model-config` | `cfg/config.yaml` | 动力学模型配置 |
+| `--output-dir` | `benchmark/outputs` | 输出目录 |
+| `--resume` | - | 跳过已有结果，继续测试 |
+| `-v, --verbose` | - | 显示详细输出 |
+
+### `python simulation/closed_loop_sim.py` - 闭环仿真
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--map-config` | `cfg/map_config.yaml` | 地图配置文件 |
 | `--model-config` | `cfg/config.yaml` | 动力学模型配置 |
+| `--seed` | 随机 | 随机种子（用于复现） |
 | `--max-time` | 自动 | 最大仿真时间 (s) |
-| `--control-dt` | `0.01` | 控制周期 (s) |
-| `--dynamics-dt` | `0.002` | 动力学积分步长 (s) |
-| `--planner` | `kinodynamic` | 规划器: `kinodynamic` 或 `old` |
-| `--position-noise` | `10 -15 0` | 初始位置偏差 [dx, dy, dz] |
-| `--heading-noise` | `0.1` | 初始航向偏差 (rad) |
+| `--output-dir` | - | 数据导出目录 |
 
-### `visualization/server.py` - Web可视化服务器
+### `python visualization/server.py` - Web 可视化
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--port` | `8080` | 端口号 |
 | `--host` | `127.0.0.1` | 主机地址 |
 
-### `simulation/open_loop_test.py` - 开环测试
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--altitude` | `400` | 初始高度 (m) |
-| `--left` | `0.0` | 左操纵绳偏转 [0,1] |
-| `--right` | `0.0` | 右操纵绳偏转 [0,1] |
-
 ---
 
 ## 模块详细说明
 
-### 1. 配置文件 (`cfg/`)
+### 1. 规划模块 (`planning/`)
 
-#### `config.yaml` - 翼伞动力学参数
-| 参数类别 | 内容 |
-|---------|------|
-| 质量参数 | 伞体质量、负载质量 |
-| 几何参数 | 翼展、面积、伞绳长度等 |
-| 气动参数 | 升力、阻力、力矩系数 |
-
-#### `map_config.yaml` - 地图与任务配置
-| 参数类别 | 内容 |
-|---------|------|
-| 地图边界 | X/Y/Z 范围 |
-| 起点/终点 | 位置、航向 |
-| 禁飞区 | 圆柱体/多边形障碍物 |
-| 约束参数 | 最小转弯半径、滑翔比范围、最低高度等 |
-
----
-
-### 2. 规划模块 (`planning/`)
-
-#### `kinodynamic_rrt.py` - ★ Kinodynamic RRT* 规划器 (推荐)
+#### `kinodynamic_rrt.py` - Kinodynamic RRT* 规划器
 
 **特点：**
-- 使用 **Dubins曲线** 作为扩展原语，生成平滑路径
-- 在规划阶段考虑 **滑翔比约束**
-- 支持导出JSON数据用于Web可视化
+- 使用 **Dubins 曲线** 作为扩展原语，生成满足最小转弯半径约束的平滑路径
+- 在规划阶段考虑 **滑翔比约束**，确保路径在翼伞物理能力范围内
+- **引导采样**：50% 概率在起点-终点走廊内采样，提高规划效率
+- 支持导出 JSON 数据用于 Web 可视化
 
-**主要方法：**
-```python
-from planning.kinodynamic_rrt import KinodynamicRRTStar
+#### `trajectory_postprocess.py` - 轨迹后处理器
 
-planner = KinodynamicRRTStar(map_manager)
-path, info = planner.plan(max_time=30.0)
+**功能：**
+- 路径平滑（三次样条插值）
+- 螺旋消高注入（当高度盈余过多时）
+- 时间参数化（基于参考速度）
+- 滑翔比验证
 
-# 导出数据到visualization/data/目录
-planner.export_to_json(path=path, path_length=info.get('path_length'))
-```
+#### `map_manager.py` - 地图管理器
 
-#### `global_planner.py` - RRT* 规划器 (旧版)
+**功能：**
+- 加载和管理地图配置（边界、障碍物、走廊）
+- 支持场景随机化（随机起点、终点、障碍物）
+- 可达性分析（检查起点到终点是否可达）
+- 碰撞检测
 
-基础的RRT*规划器，不含Dubins曲线。
-
-#### `path_smoother.py` - 路径平滑器
-
-将离散航点平滑为连续轨迹：
-- 三次样条插值
-- Dubins曲线连接
-- 时间参数化
-
-#### `trajectory.py` - 轨迹数据结构
-
-```python
-@dataclass
-class TrajectoryPoint:
-    t: float           # 时间戳 (s)
-    position: [x,y,z]  # 位置 (m)
-    velocity: [vx,vy,vz]  # 速度 (m/s)
-    heading: float     # 航向角 (rad)
-    curvature: float   # 曲率 (1/m)
-```
-
----
-
-### 3. 控制模块 (`control/`)
+### 2. 控制模块 (`control/`)
 
 #### `adrc_controller.py` - ADRC 控制器
 
@@ -198,84 +270,84 @@ class TrajectoryPoint:
 | ESO (扩展状态观测器) | 估计扰动 |
 | SEF (状态误差反馈) | 生成控制量 |
 
-**可调参数：**
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `heading_kp` | 0.8 | 航向比例增益 |
-| `heading_kd` | 0.4 | 航向微分增益 |
-| `lateral_kp` | 0.002 | 横向误差增益 |
-| `lookahead_distance` | 100.0 | 前视距离 (m) |
-| `max_deflection` | 1.0 | 最大操纵绳偏转 [0,1] |
+**输出：**
+- `delta_left`：左操纵绳偏转 [0, 1]
+- `delta_right`：右操纵绳偏转 [0, 1]
 
----
+### 3. 仿真模块 (`simulation/`)
 
-### 4. 仿真模块 (`simulation/`)
-
-#### `closed_loop_sim.py` - 闭环仿真
+#### `closed_loop_sim.py` - 闭环仿真器
 
 整合 **规划 + 控制 + 动力学** 的完整仿真。
 
 **流程：**
 ```
-加载配置 → 可达性检查 → 路径规划 → 轨迹平滑 → 初始化状态
+加载配置 → 规划路径 → 轨迹后处理 → 初始化状态
     ↓
-循环: 控制器计算 → 设置操纵绳 → 动力学积分 → 更新状态
+循环: 控制器计算 → 设置操纵绳 → 动力学积分 → 状态更新 → 失败检测
     ↓
-可视化: 3D轨迹、XY平面、跟踪误差、控制输入
+输出: 可视化 / 数据导出
 ```
 
----
+### 4. Benchmark 模块 (`benchmark/`)
 
-### 5. 可视化模块 (`visualization/`)
+#### `runner.py` - Benchmark 运行器
 
-#### Web可视化界面
+批量运行仿真，收集统计数据。
 
-基于 **Three.js** 的3D可视化，支持：
-- 查看RRT树的所有节点（按高度着色）
-- 查看最终路径
-- 查看障碍物
-- 鼠标交互（左键旋转、右键平移、滚轮缩放）
-- 选择历史数据文件
+#### `metrics.py` - 指标计算与失败检测
 
-**使用方法：**
-```bash
-# 1. 运行规划器生成数据
-python planning/kinodynamic_rrt.py
+**硬失败 (Hard Fail)**：
+- H1: 进入禁飞区 / 安全间距不足
+- H2: 姿态超限（滚转 > 60°，俯仰 > 45°）
+- H3: 数值爆炸
 
-# 2. 启动服务器
-python visualization/server.py --port=8080
+**软失败 (Soft Fail)**：
+- S1: 跟踪发散（持续误差过大）
+- S3: 长时间控制饱和
+- S4: 超时
 
-# 3. 浏览器访问 http://127.0.0.1:8080
-```
+#### `rng_manager.py` - 随机数管理
 
-**数据文件格式：**
-
-每次运行规划器会生成唯一文件名：
-```
-visualization/data/rrt_20260203_143025_123456_ok.json   # 规划成功
-visualization/data/rrt_20260203_143030_654321_fail.json # 规划失败
-```
+基于 `numpy.random.SeedSequence` 的子 RNG 管理，确保：
+- 相同种子产生相同结果
+- 不同模块的随机数互不影响
 
 ---
 
 ## 代码调用示例
 
-```python
-# 方式1: 使用闭环仿真器（推荐）
-from simulation import ClosedLoopSimulator
+### 方式 1：使用闭环仿真器
 
+```python
+from simulation.closed_loop_sim import ClosedLoopSimulator
+
+# 创建仿真器
 sim = ClosedLoopSimulator(
     map_config_path="cfg/map_config.yaml",
-    model_config_path="cfg/config.yaml"
+    model_config_path="cfg/config.yaml",
+    seed=42  # 可选，用于复现
 )
-sim.plan_kinodynamic()  # 使用新规划器
-sim.init_state()
-sim.run()
-sim.visualize()
 
-# 方式2: 分模块调用
+# 规划
+sim.plan(max_time=30.0)
+
+# 初始化状态
+sim.init_state()
+
+# 运行仿真
+sim.run(max_time=200.0)
+
+# 可视化
+sim.visualize()
+```
+
+### 方式 2：分模块调用
+
+```python
 from planning.map_manager import MapManager
 from planning.kinodynamic_rrt import KinodynamicRRTStar
+from planning.trajectory_postprocess import TrajectoryPostprocessor
 
 # 加载地图
 map_mgr = MapManager.from_yaml("cfg/map_config.yaml")
@@ -284,8 +356,25 @@ map_mgr = MapManager.from_yaml("cfg/map_config.yaml")
 planner = KinodynamicRRTStar(map_mgr)
 path, info = planner.plan(max_time=30.0)
 
-# 导出可视化数据
-planner.export_to_json(path=path, path_length=info.get('path_length'))
+# 轨迹后处理
+postprocessor = TrajectoryPostprocessor(map_mgr)
+trajectory = postprocessor.process(path, reference_speed=9.0)
+```
+
+### 方式 3：运行 Benchmark
+
+```python
+from benchmark.runner import BenchmarkRunner, ExperimentConfig
+
+config = ExperimentConfig(
+    name="my_experiment",
+    seeds=list(range(1, 101)),  # 1-100
+    scene="default",
+    map_config="cfg/map_config.yaml"
+)
+
+runner = BenchmarkRunner(config)
+results = runner.run_all()
 ```
 
 ---
@@ -299,6 +388,7 @@ planner.export_to_json(path=path, path_length=info.get('path_length'))
 | 最大滑翔比 | `glide_ratio` | 6.48 | 最大水平距离/下降高度 |
 | 最小滑翔比 | `min_glide_ratio` | 2.47 | 最小水平距离/下降高度 |
 | 安全裕度 | `safety_margin` | 15 m | 障碍物距离 |
+| 着陆半径 | `landing_radius` | 20 m | 成功判定阈值 |
 
 ---
 
@@ -317,3 +407,9 @@ tqdm
 ```bash
 pip install numpy scipy matplotlib pyyaml flask tqdm
 ```
+
+---
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。

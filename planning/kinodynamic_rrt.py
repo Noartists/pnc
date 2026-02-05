@@ -341,12 +341,14 @@ class KinodynamicRRTStar:
     def __init__(self, map_manager,
                  step_size: float = 100.0,
                  goal_sample_rate: float = 0.3,  # 增加目标采样率
-                 max_iterations: int = 5000):
+                 max_iterations: int = 5000,
+                 quiet: bool = False):
         
         self.map = map_manager
         self.step_size = step_size
         self.goal_sample_rate = goal_sample_rate
         self.max_iterations = max_iterations
+        self.quiet = quiet
         
         # 约束
         self.min_turn_radius = map_manager.constraints.min_turn_radius
@@ -362,8 +364,14 @@ class KinodynamicRRTStar:
         # 存储每条边的Dubins路径点（用于最终输出平滑路径）
         self.edge_paths: dict = {}  # {(parent_idx, child_idx): [points]}
     
-    def plan(self, max_time: float = 30.0):
-        """规划路径"""
+    def plan(self, max_time: float = 30.0, progress_callback: callable = None):
+        """
+        规划路径
+        
+        参数:
+            max_time: 最大规划时间
+            progress_callback: 进度回调 callback(iteration, max_iterations)
+        """
         # 起点终点
         start = np.array([self.map.start.x, self.map.start.y, self.map.start.z])
         goal = self.map.target.position.copy()
@@ -373,24 +381,28 @@ class KinodynamicRRTStar:
         start_heading = np.arctan2(dy, dx)
         goal_heading = self.map.target.approach_heading
         
-        print(f"\n{'='*60}")
-        print(f"  Kinodynamic RRT* 规划")
-        print(f"{'='*60}")
-        print(f"  起点: ({start[0]:.0f}, {start[1]:.0f}, {start[2]:.0f})")
-        print(f"  终点: ({goal[0]:.0f}, {goal[1]:.0f}, {goal[2]:.0f})")
+        if not self.quiet:
+            print(f"\n{'='*60}")
+            print(f"  Kinodynamic RRT* 规划")
+            print(f"{'='*60}")
+            print(f"  起点: ({start[0]:.0f}, {start[1]:.0f}, {start[2]:.0f})")
+            print(f"  终点: ({goal[0]:.0f}, {goal[1]:.0f}, {goal[2]:.0f})")
         
         # 可达性检查
         h_dist = np.linalg.norm(goal[:2] - start[:2])
         v_dist = start[2] - goal[2]
         if v_dist <= 0:
-            print("  [错误] 高度不足")
+            if not self.quiet:
+                print("  [错误] 高度不足")
             return None, {'success': False}
         
         glide = h_dist / v_dist
-        print(f"  直线滑翔比: {glide:.2f} (范围: {self.min_glide:.2f}~{self.max_glide:.2f})")
+        if not self.quiet:
+            print(f"  直线滑翔比: {glide:.2f} (范围: {self.min_glide:.2f}~{self.max_glide:.2f})")
         
         if glide > self.max_glide:
-            print("  [错误] 不可达")
+            if not self.quiet:
+                print("  [错误] 不可达")
             return None, {'success': False}
         
         # 存储目标信息供 _steer 使用
@@ -411,11 +423,18 @@ class KinodynamicRRTStar:
         best_idx = None
         best_cost = float('inf')
         
-        pbar = tqdm(total=self.max_iterations, desc="RRT*")
+        pbar = tqdm(total=self.max_iterations, desc="RRT*", disable=self.quiet)
+        last_callback_time = 0
         
         for i in range(self.max_iterations):
             if time.time() - start_time > max_time:
                 break
+            
+            # 进度回调（每0.5秒更新一次）
+            current_time = time.time()
+            if progress_callback and current_time - last_callback_time >= 0.5:
+                progress_callback(i, self.max_iterations)
+                last_callback_time = current_time
 
             # 采样
             if np.random.random() < self.goal_sample_rate:
@@ -573,26 +592,28 @@ class KinodynamicRRTStar:
         pbar.close()
         
         # 打印统计
-        print(f"\n  === 统计 ===")
-        print(f"  扩展失败: {stats['steer']}")
-        print(f"  可行性失败: {stats['feasible']}")
-        print(f"  碰撞失败: {stats['collision']}")
-        print(f"  成功添加: {stats['added']}")
+        if not self.quiet:
+            print(f"\n  === 统计 ===")
+            print(f"  扩展失败: {stats['steer']}")
+            print(f"  可行性失败: {stats['feasible']}")
+            print(f"  碰撞失败: {stats['collision']}")
+            print(f"  成功添加: {stats['added']}")
 
-        # 高度分布诊断
-        if self.nodes:
-            altitudes = [n.state.z for n in self.nodes]
-            print(f"  节点高度: min={min(altitudes):.1f}, max={max(altitudes):.1f}, "
-                  f"mean={np.mean(altitudes):.1f}")
-            low_count = sum(1 for z in altitudes if z < 30)
-            print(f"  低高度节点 (<30m): {low_count}/{len(self.nodes)}")
-            # 最近目标距离
-            min_dist = min(np.linalg.norm(n.state.position[:2] - goal[:2])
-                          for n in self.nodes)
-            print(f"  最近目标2D距离: {min_dist:.0f}m")
+            # 高度分布诊断
+            if self.nodes:
+                altitudes = [n.state.z for n in self.nodes]
+                print(f"  节点高度: min={min(altitudes):.1f}, max={max(altitudes):.1f}, "
+                      f"mean={np.mean(altitudes):.1f}")
+                low_count = sum(1 for z in altitudes if z < 30)
+                print(f"  低高度节点 (<30m): {low_count}/{len(self.nodes)}")
+                # 最近目标距离
+                min_dist = min(np.linalg.norm(n.state.position[:2] - goal[:2])
+                              for n in self.nodes)
+                print(f"  最近目标2D距离: {min_dist:.0f}m")
         
         if not goal_reached:
-            print(f"  [失败] 未到达目标")
+            if not self.quiet:
+                print(f"  [失败] 未到达目标")
             return None, {'success': False, 'stats': stats}
 
         # 提取路径
@@ -602,7 +623,8 @@ class KinodynamicRRTStar:
         # --- 后处理：如果终点高度过高，注入螺旋下降段 ---
         path = self._inject_spiral_descent(path, goal, goal_state.heading)
 
-        print(f"  [成功] 路径点数: {len(path)}")
+        if not self.quiet:
+            print(f"  [成功] 路径点数: {len(path)}")
 
         return path, {'success': True, 'stats': stats, 'path_length': best_cost}
     
@@ -956,7 +978,8 @@ class KinodynamicRRTStar:
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
         
-        print(f"  数据已导出: {filepath}")
+        if not self.quiet:
+            print(f"  数据已导出: {filepath}")
         return filepath
 
     def _inject_spiral_descent(self, path: List[np.ndarray], goal: np.ndarray,
@@ -993,8 +1016,9 @@ class KinodynamicRRTStar:
         if excess_alt < 10.0:
             return path  # 多余量太小，忽略
 
-        print(f"  [后处理] 滑翔比 {needed_glide:.2f} < min_glide {self.min_glide:.2f}，"
-              f"需螺旋消高 {excess_alt:.1f}m")
+        if not self.quiet:
+            print(f"  [后处理] 滑翔比 {needed_glide:.2f} < min_glide {self.min_glide:.2f}，"
+                  f"需螺旋消高 {excess_alt:.1f}m")
 
         # 螺旋参数
         loiter_radius = self.min_turn_radius * 1.5
@@ -1027,7 +1051,8 @@ class KinodynamicRRTStar:
 
         # 检查螺旋段碰撞
         if self._has_collision_path(spiral_path):
-            print(f"  [后处理] 螺旋段有碰撞，跳过注入")
+            if not self.quiet:
+                print(f"  [后处理] 螺旋段有碰撞，跳过注入")
             return path
 
         # 拼接：path[:-1]（去掉goal） + 螺旋段 + goal

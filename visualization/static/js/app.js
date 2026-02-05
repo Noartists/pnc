@@ -306,8 +306,14 @@ function updateInfo() {
     const simInfo = document.getElementById('sim-info');
 
     if (data.data_type === 'simulation') {
-        badge.textContent = '仿真';
-        badge.className = 'data-type-badge badge-sim';
+        // 判断是否来自 benchmark
+        if (data.source === 'benchmark') {
+            badge.textContent = 'Benchmark';
+            badge.className = 'data-type-badge badge-benchmark';
+        } else {
+            badge.textContent = '仿真';
+            badge.className = 'data-type-badge badge-sim';
+        }
         rrtInfo.style.display = 'none';
         simInfo.style.display = 'block';
 
@@ -346,12 +352,16 @@ function updateInfo() {
     if (data.start) {
         document.getElementById('start-pos').textContent =
             `(${data.start.x.toFixed(0)}, ${data.start.y.toFixed(0)}, ${data.start.z.toFixed(0)})`;
+    } else {
+        document.getElementById('start-pos').textContent = '-';
     }
     if (data.goal) {
         document.getElementById('goal-pos').textContent =
             `(${data.goal.x.toFixed(0)}, ${data.goal.y.toFixed(0)}, ${data.goal.z.toFixed(0)})`;
+    } else {
+        document.getElementById('goal-pos').textContent = '-';
     }
-    if (data.config) {
+    if (data.config && data.config.min_glide !== undefined) {
         document.getElementById('glide-range').textContent =
             `${data.config.min_glide.toFixed(2)} ~ ${data.config.max_glide.toFixed(2)}`;
     } else {
@@ -721,6 +731,129 @@ function resetCamera() {
     camera.up.set(0, 0, 1);
     controls.target.set(750, 500, 200);
     controls.update();
+}
+
+// ============================================================
+//                     Benchmark 浏览
+// ============================================================
+
+let currentExperiment = null;
+let currentScene = null;
+
+function openBenchmarkPanel() {
+    document.getElementById('benchmark-panel').classList.add('visible');
+    loadBenchmarkExperiments();
+}
+
+function closeBenchmarkPanel() {
+    document.getElementById('benchmark-panel').classList.remove('visible');
+}
+
+function loadBenchmarkExperiments() {
+    const content = document.getElementById('benchmark-content');
+    content.innerHTML = '<p style="color:#888;">加载中...</p>';
+
+    fetch('/api/benchmark/experiments')
+        .then(response => response.json())
+        .then(d => {
+            if (!d.experiments || d.experiments.length === 0) {
+                content.innerHTML = '<p style="color:#888;">没有找到 Benchmark 实验。运行 benchmark 后刷新。</p>' +
+                    '<p style="color:#555;font-size:11px;">目录: ' + (d.benchmark_dir || '-') + '</p>';
+                return;
+            }
+
+            let html = '';
+            d.experiments.forEach(exp => {
+                html += `<div class="exp-card">
+                    <h3>📁 ${exp.name}</h3>
+                    <div class="scene-list">`;
+                
+                exp.scenes.forEach(scene => {
+                    const summary = scene.summary;
+                    const rateText = summary ? 
+                        `<span class="success-rate">${summary.success_rate.toFixed(0)}%</span> (${summary.success}/${summary.total})` :
+                        `${scene.seed_count} seeds`;
+                    html += `<div class="scene-badge" onclick="loadBenchmarkScene('${exp.name}', '${scene.name}')">
+                        🎬 ${scene.name}: ${rateText}
+                    </div>`;
+                });
+
+                html += `</div></div>`;
+            });
+
+            content.innerHTML = html;
+        })
+        .catch(err => {
+            content.innerHTML = '<p style="color:#f44;">加载失败: ' + err.message + '</p>';
+        });
+}
+
+function loadBenchmarkScene(expName, sceneName) {
+    currentExperiment = expName;
+    currentScene = sceneName;
+
+    const content = document.getElementById('benchmark-content');
+    content.innerHTML = '<p style="color:#888;">加载场景...</p>';
+
+    fetch(`/api/benchmark/experiment/${expName}`)
+        .then(response => response.json())
+        .then(d => {
+            const scene = d.scenes[sceneName];
+            if (!scene) {
+                content.innerHTML = '<p style="color:#f44;">场景未找到</p>';
+                return;
+            }
+
+            let html = `<button class="secondary" onclick="loadBenchmarkExperiments()" style="margin-bottom:15px;">← 返回实验列表</button>`;
+            html += `<h3 style="color:#4fc3f7;margin-bottom:15px;">📁 ${expName} / 🎬 ${sceneName}</h3>`;
+            html += '<div class="seed-grid">';
+
+            scene.seeds.forEach(s => {
+                let statusClass = 'unknown';
+                let statusIcon = '?';
+                if (s.metrics) {
+                    if (s.metrics.success) {
+                        statusClass = 'success';
+                        statusIcon = '✓';
+                    } else {
+                        statusClass = 'failed';
+                        statusIcon = '✗';
+                    }
+                }
+                html += `<button class="seed-btn ${statusClass}" onclick="loadBenchmarkCase('${expName}', '${sceneName}', ${s.seed})">
+                    ${statusIcon} Seed ${s.seed}
+                </button>`;
+            });
+
+            html += '</div>';
+            content.innerHTML = html;
+        })
+        .catch(err => {
+            content.innerHTML = '<p style="color:#f44;">加载失败: ' + err.message + '</p>';
+        });
+}
+
+function loadBenchmarkCase(expName, sceneName, seed) {
+    document.getElementById('loading').style.display = 'block';
+    closeBenchmarkPanel();
+
+    fetch(`/api/benchmark/case/${expName}/${sceneName}/${seed}`)
+        .then(response => response.json())
+        .then(d => {
+            data = d;
+            document.getElementById('loading').style.display = 'none';
+
+            if (data.error) {
+                alert(data.error);
+                return;
+            }
+
+            onDataLoaded();
+        })
+        .catch(err => {
+            document.getElementById('loading').style.display = 'none';
+            alert('加载失败: ' + err.message);
+        });
 }
 
 // 兼容旧接口

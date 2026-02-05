@@ -152,7 +152,7 @@ trajectory:
 # 启用后会覆盖上面手动定义的禁飞区，并随机化起点终点
 randomization:
   enabled: true           # 是否启用随机化 (true/false)
-  seed: 42                # 随机种子 (null=每次不同, 固定数字=可复现)
+  seed: null                # 随机种子 (null=每次不同, 固定数字=可复现)
   randomize_endpoints: true  # 是否随机化起点终点
   n_obstacles: 20         # 障碍物数量
   radius_range: [40, 100]   # 半径范围 (m)

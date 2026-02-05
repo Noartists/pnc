@@ -15,11 +15,12 @@
 import os
 import sys
 import numpy as np
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Any
 from dataclasses import dataclass
 from scipy.integrate import odeint
 import time
 import yaml
+from datetime import datetime
 
 # 添加项目根目录到路径
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,13 +28,18 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from planning.map_manager import MapManager
-from planning.global_planner import RRTStarPlanner
-from planning.path_smoother import PathSmoother
 from planning.trajectory import Trajectory, TrajectoryPoint
 from planning.kinodynamic_rrt import KinodynamicRRTStar
 from planning.trajectory_postprocess import TrajectoryPostprocessor
 from control.adrc_controller import ParafoilADRCController, ControlOutput
 from models.parafoil_model import ParafoilParams, parafoil_dynamics
+
+# Benchmark 框架
+from benchmark.rng_manager import RNGManager, get_config_hash, get_git_commit
+from benchmark.metrics import (
+    MetricsCalculator, FailureDetector, FailureThresholds, TerminationReason
+)
+from benchmark.outputs import MetricsOutput, CaseOutput, create_output_dir
 
 
 # ============================================================
@@ -104,26 +110,54 @@ class ClosedLoopSimulator:
     闭环仿真器
     
     整合规划、控制、动力学模型
+    支持 Benchmark 框架的标准化输出
     """
     
     def __init__(self, 
                  map_config_path: str,
                  model_config_path: str,
                  control_dt: float = 0.01,
-                 dynamics_dt: float = 0.001):
+                 dynamics_dt: float = 0.001,
+                 seed: int = None,
+                 scene_name: str = "default",
+                 quiet: bool = False):
         """
         参数:
             map_config_path: 地图配置文件路径
             model_config_path: 动力学模型配置文件路径
             control_dt: 控制周期 (s)
             dynamics_dt: 动力学积分步长 (s)
+            seed: 随机数种子（用于 benchmark，None 表示不使用）
+            scene_name: 场景名称（用于 benchmark 输出）
+            quiet: 静默模式（不打印详细信息）
         """
         self.control_dt = control_dt
         self.dynamics_dt = dynamics_dt
+        self.scene_name = scene_name
+        self.quiet = quiet
+        
+        # 保存配置路径
+        self.map_config_path = map_config_path
+        self.model_config_path = model_config_path
+        
+        # RNG 管理器（用于可复现性）
+        self.seed = seed
+        self.rng: Optional[RNGManager] = None
+        if seed is not None:
+            self.rng = RNGManager(seed)
         
         # 加载地图
-        print("[1/4] 加载地图配置...")
-        self.map_manager = MapManager.from_yaml(map_config_path)
+        if not quiet:
+            print("[1/4] 加载地图配置...")
+        # 如果有 seed，传给 map_manager 用于场景随机化
+        if self.rng is not None:
+            self.map_manager = MapManager.from_yaml(
+                map_config_path, 
+                rng=self.rng.get_env_rng(),
+                quiet=quiet
+            )
+        else:
+            self.map_manager = MapManager.from_yaml(map_config_path, quiet=quiet)
 
         # 读取轨迹参数（参考速度）
         with open(map_config_path, 'r', encoding='utf-8') as f:
@@ -133,19 +167,13 @@ class ClosedLoopSimulator:
         self.reference_speed = reference_speed
         
         # 检查可达性
-        self.map_manager.print_reachability_report()
+        if not quiet:
+            self.map_manager.print_reachability_report()
         
         # 加载动力学模型参数
-        print("[2/4] 加载动力学模型...")
+        if not quiet:
+            print("[2/4] 加载动力学模型...")
         self.para = ParafoilParams.from_yaml(model_config_path)
-        
-        # 创建规划器
-        self.planner = RRTStarPlanner(self.map_manager)
-        self.smoother = PathSmoother(
-            turn_radius=self.map_manager.constraints.min_turn_radius,
-            reference_speed=reference_speed,
-            control_frequency=1.0 / control_dt
-        )
         
         # 创建控制器
         # ============ 控制器超参数说明 ============
@@ -179,7 +207,8 @@ class ClosedLoopSimulator:
         )
         
         # 调试模式（可通过参数控制）
-        self.controller_debug = True  # 设为 True 启用控制器调试输出
+        # 静默模式下禁用调试输出
+        self.controller_debug = not self.quiet  # 静默模式下关闭控制器调试
         if self.controller_debug:
             self.controller.set_debug(True)
         
@@ -187,98 +216,121 @@ class ClosedLoopSimulator:
         self.trajectory: Optional[Trajectory] = None
         self.state: Optional[np.ndarray] = None
         self.log: Optional[SimulationLog] = None
-    
-    def plan(self, max_time: float = 30.0) -> bool:
-        """
-        运行路径规划
         
-        参数:
-            max_time: 最大规划时间 (s)
+        # === Benchmark 相关 ===
+        # 失败检测器
+        target_pos = None
+        if self.map_manager.target:
+            target_pos = self.map_manager.target.position
         
-        返回:
-            是否成功
-        """
-        print("[3/4] 运行 RRT* 路径规划（含画圆消高）...")
-        path, info = self.planner.plan_with_loiter(max_time=max_time)
-
-        if path is None:
-            print("    路径规划失败!")
-            return False
-
-        # 显示画圆信息
-        if info.get('loiter_loops', 0) > 0:
-            print(f"    规划完成: {len(path)} 航点, 长度 {info['path_length']:.1f}m")
-            print(f"    画圆消高: {info['loiter_loops']}圈, 半径 {info['loiter_radius']:.1f}m, {info['loiter_direction'].upper()}")
-        else:
-            print(f"    规划完成: {len(path)} 航点, 长度 {info['path_length']:.1f}m (无需画圆)")
+        # 收集禁飞区信息
+        nfz_list = []
+        for obs in self.map_manager.obstacles:
+            obs_type = obs.__class__.__name__.lower()
+            if obs_type == 'cylinder':
+                nfz_list.append({
+                    'type': 'cylinder',
+                    'center': [obs.center[0], obs.center[1]],
+                    'radius': obs.radius,
+                    'z_min': obs.z_min,
+                    'z_max': obs.z_max
+                })
+            elif obs_type == 'prism':
+                nfz_list.append({
+                    'type': 'polygon',
+                    'vertices': obs.polygon.vertices,
+                    'z_min': obs.z_min,
+                    'z_max': obs.z_max
+                })
         
-        # 路径平滑
-        # 注意：不传递map_manager，因为画圆消高已经在plan_with_loiter中处理了
-        # PathSmoother只负责平滑，不再重复添加画圆
-        print("[4/4] 路径平滑...")
-        end_heading = self.map_manager.target.approach_heading if self.map_manager.target else None
-        self.trajectory = self.smoother.smooth(
-            path,
-            end_heading=end_heading,
-            waypoint_density=15
+        self.failure_detector = FailureDetector(
+            thresholds=FailureThresholds(
+                landing_radius=20.0,
+                safety_margin=self.map_manager.constraints.safety_margin
+            ),
+            no_fly_zones=nfz_list,
+            target_position=target_pos
         )
+        self.failure_detector.set_dt(control_dt)
         
-        print(f"    生成轨迹: {len(self.trajectory)} 点, 时长 {self.trajectory.duration:.1f}s")
+        # 指标计算器
+        self.metrics_calculator = MetricsCalculator(target_position=target_pos)
         
-        # 验证轨迹的下降率是否在物理可行范围内
-        self._validate_trajectory_descent_rate()
+        # 规划耗时记录
+        self.planning_time: float = 0.0
         
-        self.controller.set_trajectory(self.trajectory)
-        
-        return True
+        # Benchmark 输出
+        self.metrics_output: Optional[MetricsOutput] = None
+        self.case_output: Optional[CaseOutput] = None
     
-    def plan_kinodynamic(self, max_time: float = 30.0, smooth: bool = True) -> bool:
+    def plan(self, max_time: float = 30.0, smooth: bool = True, 
+             progress_callback: callable = None) -> bool:
         """
         使用Kinodynamic RRT*规划路径
 
-        相比旧方法，这个方法：
-        1. 在规划阶段就考虑滑翔比约束
-        2. 生成的轨迹更符合翼伞物理特性
+        特点：
+        1. 使用Dubins曲线扩展，生成平滑路径
+        2. 在规划阶段考虑滑翔比约束
         3. 使用 TrajectoryPostprocessor 进行平滑处理
+        4. 自动注入螺旋下降段消高
 
         参数:
             max_time: 最大规划时间 (s)
             smooth: 是否进行轨迹平滑（默认True）
+            progress_callback: 规划进度回调 callback(iteration, max_iterations)
 
         返回:
             是否成功
         """
-        print("[3/4] 运行 Kinodynamic RRT* 路径规划...")
+        if not self.quiet:
+            print("[3/4] 运行 Kinodynamic RRT* 路径规划...")
+
+        # 固定 RRT* 的随机数种子，确保相同 seed 产生相同规划结果
+        # 这样切换控制器时，参考轨迹保持不变
+        if self.seed is not None:
+            np.random.seed(self.seed)
+
+        # 记录规划开始时间
+        plan_start_time = time.time()
 
         # 创建Kinodynamic RRT*规划器
-        kino_planner = KinodynamicRRTStar(self.map_manager)
-        path, info = kino_planner.plan(max_time=max_time)
+        kino_planner = KinodynamicRRTStar(self.map_manager, quiet=self.quiet)
+        path, info = kino_planner.plan(max_time=max_time, progress_callback=progress_callback)
+
+        # 记录规划耗时
+        self.planning_time = time.time() - plan_start_time
 
         if path is None:
-            print("    路径规划失败!")
+            if not self.quiet:
+                print("    路径规划失败!")
             return False
 
-        print(f"    规划完成: {len(path)} 航点")
-        if 'path_length' in info:
-            print(f"    路径长度: {info['path_length']:.1f}m")
+        if not self.quiet:
+            print(f"    规划完成: {len(path)} 航点, 耗时: {self.planning_time:.2f}s")
+            if 'path_length' in info:
+                print(f"    路径长度: {info['path_length']:.1f}m")
 
         # 使用 TrajectoryPostprocessor 进行平滑处理
-        print("[4/4] 轨迹后处理（平滑 + 时间参数化）...")
+        if not self.quiet:
+            print("[4/4] 轨迹后处理（平滑 + 时间参数化）...")
         postprocessor = TrajectoryPostprocessor(
             reference_speed=self.reference_speed,
             control_frequency=1.0 / self.control_dt,
-            min_turn_radius=self.map_manager.constraints.min_turn_radius
+            min_turn_radius=self.map_manager.constraints.min_turn_radius,
+            quiet=self.quiet
         )
 
         end_heading = self.map_manager.target.approach_heading if self.map_manager.target else None
         self.trajectory = postprocessor.process(path, smooth=smooth, end_heading=end_heading)
 
         if len(self.trajectory) == 0:
-            print("    轨迹生成失败!")
+            if not self.quiet:
+                print("    轨迹生成失败!")
             return False
 
         # 验证轨迹
-        self._validate_trajectory_descent_rate()
+        if not self.quiet:
+            self._validate_trajectory_descent_rate()
 
         self.controller.set_trajectory(self.trajectory)
 
@@ -372,8 +424,9 @@ class ClosedLoopSimulator:
         sink_rate_min = v / glide_max  # 最小下沉率 ≈ 1.4 m/s
         sink_rate_max = v / glide_min  # 最大下沉率 ≈ 3.6 m/s
         
-        print(f"\n    === 轨迹下降率验证 ===")
-        print(f"    物理可行下沉率: {sink_rate_min:.2f} ~ {sink_rate_max:.2f} m/s")
+        if not self.quiet:
+            print(f"\n    === 轨迹下降率验证 ===")
+            print(f"    物理可行下沉率: {sink_rate_min:.2f} ~ {sink_rate_max:.2f} m/s")
         
         # 分析轨迹的下降率
         positions = self.trajectory.to_position_array()
@@ -407,7 +460,7 @@ class ClosedLoopSimulator:
                 ok_segments += 1
         
         total = climb_segments + too_slow_segments + too_fast_segments + ok_segments
-        if total > 0:
+        if not self.quiet and total > 0:
             ok_ratio = ok_segments / total * 100
             print(f"    轨迹段统计 (共{total}段):")
             print(f"      - 可跟踪:   {ok_segments} ({ok_ratio:.1f}%)")
@@ -424,7 +477,7 @@ class ClosedLoopSimulator:
         for i in range(n_points - 1):
             total_dxy += np.linalg.norm(positions[i+1, :2] - positions[i, :2])
         
-        if total_dxy > 0:
+        if not self.quiet and total_dxy > 0:
             avg_glide = total_dxy / max(total_dz, 0.01)
             print(f"    整体平均滑翔比: {avg_glide:.2f} (目标范围: {glide_min:.2f} ~ {glide_max:.2f})")
     
@@ -433,7 +486,8 @@ class ClosedLoopSimulator:
                    heading: float = None,
                    velocity: float = 10.0,
                    position_noise: np.ndarray = None,
-                   heading_noise: float = 0.0) -> np.ndarray:
+                   heading_noise: float = 0.0,
+                   use_rng: bool = True) -> np.ndarray:
         """
         初始化仿真状态
         
@@ -441,8 +495,9 @@ class ClosedLoopSimulator:
             position: 初始位置 [x, y, z]，默认使用轨迹起点
             heading: 初始航向 (rad)，默认使用轨迹起点
             velocity: 初始前向速度 (m/s)
-            position_noise: 位置噪声 [dx, dy, dz]
-            heading_noise: 航向噪声 (rad)
+            position_noise: 位置噪声 [dx, dy, dz]，如果有 RNG 且 use_rng=True 则自动采样
+            heading_noise: 航向噪声 (rad)，如果有 RNG 且 use_rng=True 则自动采样
+            use_rng: 是否使用 RNG 采样噪声（仅当 self.rng 存在时生效）
         
         返回:
             初始状态向量 (20,)
@@ -458,6 +513,18 @@ class ClosedLoopSimulator:
         
         if heading is None:
             heading = init_point.heading
+        
+        # 如果有 RNG，使用 RNG 采样噪声
+        if self.rng is not None and use_rng:
+            if position_noise is None:
+                # 默认噪声范围
+                position_noise = self.rng.sample_position_noise(
+                    x_range=(-20, 20),
+                    y_range=(-20, 20),
+                    z_range=(-10, 10)
+                )
+            if heading_noise == 0.0:
+                heading_noise = self.rng.sample_heading_noise(range_rad=0.2)
         
         # 添加噪声
         if position_noise is not None:
@@ -545,22 +612,24 @@ class ClosedLoopSimulator:
             try:
                 dydt = parafoil_dynamics(next_state, t, self.para)
             except Exception as e:
-                print(f"[错误] 动力学模型计算失败! t={t:.3f}s, step={i}/{n_substeps}")
-                print(f"  状态[5] (heading) = {np.degrees(next_state[5]):.1f}°")
-                print(f"  错误: {e}")
+                if not self.quiet:
+                    print(f"[错误] 动力学模型计算失败! t={t:.3f}s, step={i}/{n_substeps}")
+                    print(f"  状态[5] (heading) = {np.degrees(next_state[5]):.1f}°")
+                    print(f"  错误: {e}")
                 raise
             
             # 检查是否有数值异常
             if np.any(np.isnan(dydt)) or np.any(np.isinf(dydt)):
-                print(f"[错误] 动力学模型返回NaN/Inf! t={t:.3f}s, step={i}/{n_substeps}")
-                print(f"  state[5] (heading) = {np.degrees(next_state[5]):.1f}°")
-                print(f"  dydt[5] (d_heading/dt) = {np.degrees(dydt[5]):.1f}°/s")
-                print(f"  dydt范围: [{np.min(dydt):.2e}, {np.max(dydt):.2e}]")
+                if not self.quiet:
+                    print(f"[错误] 动力学模型返回NaN/Inf! t={t:.3f}s, step={i}/{n_substeps}")
+                    print(f"  state[5] (heading) = {np.degrees(next_state[5]):.1f}°")
+                    print(f"  dydt[5] (d_heading/dt) = {np.degrees(dydt[5]):.1f}°/s")
+                    print(f"  dydt范围: [{np.min(dydt):.2e}, {np.max(dydt):.2e}]")
                 raise ValueError("动力学模型数值异常")
             
             # 检查导数是否过大（可能导致数值不稳定）
             max_derivative = np.max(np.abs(dydt))
-            if max_derivative > 1e6:
+            if max_derivative > 1e6 and not self.quiet:
                 print(f"[警告] 导数过大! t={t:.3f}s, step={i}/{n_substeps}, max={max_derivative:.2e}")
             
             next_state = next_state + dydt * actual_dt
@@ -584,10 +653,11 @@ class ClosedLoopSimulator:
             
             # 检查状态是否异常
             if np.any(np.isnan(next_state)) or np.any(np.isinf(next_state)):
-                print(f"[错误] 状态向量出现NaN/Inf! t={t:.3f}s, step={i}/{n_substeps}")
-                print(f"  next_state[3] (roll) = {np.degrees(next_state[3]):.1f}°")
-                print(f"  next_state[4] (pitch) = {np.degrees(next_state[4]):.1f}°")
-                print(f"  next_state[5] (heading) = {np.degrees(next_state[5]):.1f}°")
+                if not self.quiet:
+                    print(f"[错误] 状态向量出现NaN/Inf! t={t:.3f}s, step={i}/{n_substeps}")
+                    print(f"  next_state[3] (roll) = {np.degrees(next_state[3]):.1f}°")
+                    print(f"  next_state[4] (pitch) = {np.degrees(next_state[4]):.1f}°")
+                    print(f"  next_state[5] (heading) = {np.degrees(next_state[5]):.1f}°")
                 raise ValueError("状态向量数值异常")
         
         return next_state, ctrl
@@ -606,7 +676,9 @@ class ClosedLoopSimulator:
             stop_on_ground: bool = True,
             stop_on_target: bool = True,
             target_threshold: float = 30.0,
-            verbose: bool = True) -> SimulationLog:
+            enable_failure_detection: bool = True,
+            verbose: bool = True,
+            progress_callback: callable = None) -> SimulationLog:
         """
         运行闭环仿真
         
@@ -615,7 +687,9 @@ class ClosedLoopSimulator:
             stop_on_ground: 落地时停止
             stop_on_target: 到达目标时停止
             target_threshold: 到达目标阈值 (m)
+            enable_failure_detection: 是否启用失败检测（Benchmark 模式）
             verbose: 是否打印进度
+            progress_callback: 进度回调函数 callback(t, progress)
         
         返回:
             SimulationLog: 仿真记录
@@ -629,8 +703,13 @@ class ClosedLoopSimulator:
         # 初始化记录
         self.log = SimulationLog()
         
+        # 重置失败检测器
+        if enable_failure_detection:
+            self.failure_detector.reset()
+        
         state = self.state.copy()
         t = 0.0
+        termination_reason: Optional[TerminationReason] = None
         
         if verbose:
             print("\n" + "=" * 60)
@@ -639,23 +718,88 @@ class ClosedLoopSimulator:
             print(f"  最大时间: {max_time:.1f}s")
             print(f"  控制周期: {self.control_dt*1000:.1f}ms")
             print(f"  积分步长: {self.dynamics_dt*1000:.2f}ms")
+            if self.seed is not None:
+                print(f"  Seed: {self.seed}")
         
         start_time = time.time()
         last_print = 0
+        prev_euler = None
         
         while t < max_time:
             # 仿真单步
-            next_state, ctrl = self.step(state, t)
+            try:
+                next_state, ctrl = self.step(state, t)
+            except ValueError as e:
+                # 数值异常 - H3 失败
+                if enable_failure_detection:
+                    termination_reason = TerminationReason.H3_NUMERICAL_EXPLOSION
+                    self.failure_detector.detection_results['H3_numerical_explosion'] = True
+                    self.failure_detector.hard_fail_detected = True
+                    self.failure_detector.termination_reason = termination_reason
+                    self.failure_detector.termination_time = t
+                if verbose:
+                    print(f"\n  [数值异常] t={t:.1f}s: {e}")
+                break
             
             # 记录
             self.log.append(t, state, ctrl)
+            
+            # === 失败检测 ===
+            if enable_failure_detection:
+                # 提取状态
+                position = state[0:3]
+                velocity_body = state[8:11]
+                euler = state[3:6]
+                
+                # 计算惯性系速度
+                psi = euler[2]
+                vx = velocity_body[0] * np.cos(psi) - velocity_body[1] * np.sin(psi)
+                vy = velocity_body[0] * np.sin(psi) + velocity_body[1] * np.cos(psi)
+                vz = -velocity_body[2]
+                velocity = np.array([vx, vy, vz])
+                
+                # 计算姿态角速率（简单差分）
+                if prev_euler is not None:
+                    euler_rate = (euler - prev_euler) / self.control_dt
+                    # 处理角度跳变
+                    for i in range(3):
+                        if euler_rate[i] > np.pi / self.control_dt:
+                            euler_rate[i] -= 2 * np.pi / self.control_dt
+                        elif euler_rate[i] < -np.pi / self.control_dt:
+                            euler_rate[i] += 2 * np.pi / self.control_dt
+                else:
+                    euler_rate = np.zeros(3)
+                prev_euler = euler.copy()
+                
+                # 检测失败
+                failure = self.failure_detector.check_step(
+                    t=t,
+                    position=position,
+                    velocity=velocity,
+                    euler=euler,
+                    euler_rate=euler_rate,
+                    control=(ctrl.delta_left, ctrl.delta_right),
+                    cross_track_error=ctrl.cross_track_error,
+                    max_time=max_time
+                )
+                
+                if failure is not None:
+                    termination_reason = failure
+                    if verbose:
+                        print(f"\n  [失败检测] t={t:.1f}s: {failure.value}")
+                    break
             
             # 更新状态
             state = next_state
             t += self.control_dt
             
-            # 进度打印
-            if verbose and t - last_print >= 5.0:
+            # 进度回调（每秒更新一次）
+            if progress_callback and t - last_print >= 1.0:
+                progress = self.controller.get_progress()
+                progress_callback(t, progress)
+                last_print = t
+            # 进度打印（verbose 模式，每5秒打印一次）
+            elif verbose and t - last_print >= 5.0:
                 pos = state[0:3]
                 progress = self.controller.get_progress() * 100
                 print(f"  t={t:6.1f}s | pos=({pos[0]:7.1f}, {pos[1]:7.1f}, {pos[2]:6.1f}) | progress={progress:5.1f}%")
@@ -665,20 +809,37 @@ class ClosedLoopSimulator:
             if stop_on_ground and state[2] < 0:
                 if verbose:
                     print(f"\n  [落地] t={t:.1f}s, 位置=({state[0]:.1f}, {state[1]:.1f}, {state[2]:.1f})")
+                termination_reason = TerminationReason.GROUND_CONTACT
                 break
             
             # 停止条件: 到达目标
             if stop_on_target and self.controller.is_finished(state[0:3], threshold=target_threshold):
                 if verbose:
                     print(f"\n  [到达目标] t={t:.1f}s")
+                # 检查是否真正成功
+                if enable_failure_detection:
+                    if self.failure_detector.check_success(state[0:3]):
+                        termination_reason = TerminationReason.SUCCESS
+                    else:
+                        termination_reason = TerminationReason.GROUND_CONTACT
+                else:
+                    termination_reason = TerminationReason.SUCCESS
                 break
         
         elapsed = time.time() - start_time
+        
+        # 存储终止信息
+        self._last_termination_reason = termination_reason
+        self._last_wall_time = elapsed
+        self._last_flight_time = t
+        self._last_final_state = state.copy()
         
         if verbose:
             print("=" * 60)
             print(f"  仿真完成")
             print(f"  仿真时长: {t:.1f}s, 计算耗时: {elapsed:.2f}s")
+            if termination_reason:
+                print(f"  终止原因: {termination_reason.value}")
             
             # 计算跟踪指标
             current_pos = state[0:3]
@@ -698,9 +859,248 @@ class ClosedLoopSimulator:
             print(f"  到目标终点:   {dist_to_goal:.1f}m")
             print(f"    - 水平距离: {horizontal_to_goal:.1f}m")
             print(f"    - 高度差:   {altitude_to_goal:+.1f}m")
+            
+            # 判定成功/失败
+            if enable_failure_detection:
+                success = self.failure_detector.check_success(current_pos)
+                print(f"\n  === 最终判定 ===")
+                print(f"  成功: {'✓ YES' if success else '✗ NO'}")
+                if not success and termination_reason:
+                    print(f"  原因: {termination_reason.value}")
+            
             print("=" * 60)
         
         return self.log
+    
+    def compute_metrics(self) -> Dict[str, Any]:
+        """
+        计算 Quality 指标
+        
+        返回:
+            指标字典
+        """
+        if self.log is None or len(self.log.t) == 0:
+            return {}
+        
+        data = self.log.to_arrays()
+        
+        # 构建控制量数组
+        controls = np.column_stack([
+            data['delta_left'],
+            data['delta_right']
+        ])
+        
+        # 计算指标
+        metrics = self.metrics_calculator.compute_all(
+            positions=data['position'],
+            ref_positions=data['ref_position'],
+            controls=controls,
+            euler=data['euler'],
+            times=data['t'],
+            cross_track_errors=data['cross_track_error']
+        )
+        
+        return metrics
+    
+    def export_benchmark_results(self, output_dir: str) -> Tuple[str, str]:
+        """
+        导出 Benchmark 标准化结果
+        
+        参数:
+            output_dir: 输出目录（例如 benchmark/outputs/exp_xxx/scene1/seed_001）
+        
+        返回:
+            (metrics_path, case_path) 两个文件的路径
+        """
+        import json
+        
+        if self.log is None or len(self.log.t) == 0:
+            raise ValueError("没有仿真数据可导出")
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # === 1. 构建 metrics.json ===
+        metrics_output = MetricsOutput()
+        
+        # 复现信息
+        metrics_output.seed = self.seed if self.seed is not None else -1
+        metrics_output.config_hash = self._compute_config_hash()
+        metrics_output.git_commit = get_git_commit()
+        
+        # 场景信息
+        metrics_output.scene = self.scene_name
+        metrics_output.wind_speed = 0.0  # 目前无风
+        metrics_output.controller = "adrc"
+        
+        # 成功判定
+        final_pos = self._last_final_state[0:3] if hasattr(self, '_last_final_state') else self.log.position[-1]
+        metrics_output.success = self.failure_detector.check_success(final_pos)
+        metrics_output.termination_reason = (
+            self._last_termination_reason.value 
+            if hasattr(self, '_last_termination_reason') and self._last_termination_reason 
+            else "unknown"
+        )
+        metrics_output.termination_time = (
+            self._last_flight_time if hasattr(self, '_last_flight_time') else self.log.t[-1]
+        )
+        
+        # 失败检测结果
+        det = self.failure_detector.detection_results
+        metrics_output.hard_fail.H1_nfz_violation = det.get('H1_nfz_violation', False)
+        metrics_output.hard_fail.H1_clearance_violation = det.get('H1_clearance_violation', False)
+        metrics_output.hard_fail.H2_attitude_violation = det.get('H2_attitude_violation', False)
+        metrics_output.hard_fail.H3_numerical_explosion = det.get('H3_numerical_explosion', False)
+        
+        metrics_output.soft_fail.S1_tracking_divergence = det.get('S1_tracking_divergence', False)
+        metrics_output.soft_fail.S3_saturation_divergence = det.get('S3_saturation_divergence', False)
+        metrics_output.soft_fail.S4_timeout = det.get('S4_timeout', False)
+        
+        # Quality 指标
+        quality = self.compute_metrics()
+        metrics_output.quality.ADE = quality.get('ADE', 0.0)
+        metrics_output.quality.RMSE = quality.get('RMSE', 0.0)
+        metrics_output.quality.FDE = quality.get('FDE', 0.0)
+        metrics_output.quality.FDE_horizontal = quality.get('FDE_horizontal', 0.0)
+        metrics_output.quality.FDE_vertical = quality.get('FDE_vertical', 0.0)
+        metrics_output.quality.mean_cross_track_error = quality.get('mean_cross_track_error', 0.0)
+        metrics_output.quality.max_cross_track_error = quality.get('max_cross_track_error', 0.0)
+        metrics_output.quality.delta_u_sum = quality.get('delta_u_sum', 0.0)
+        metrics_output.quality.mean_control_effort = quality.get('mean_control_effort', 0.0)
+        metrics_output.quality.max_roll = quality.get('max_roll', 0.0)
+        metrics_output.quality.max_pitch = quality.get('max_pitch', 0.0)
+        metrics_output.quality.max_yaw_rate = quality.get('max_yaw_rate', 0.0)
+        metrics_output.quality.saturation_ratio = quality.get('saturation_ratio', 0.0)
+        
+        # 时间信息
+        metrics_output.timing.planning_time = self.planning_time
+        metrics_output.timing.flight_time = quality.get('flight_time', 0.0)
+        metrics_output.timing.wall_time = self._last_wall_time if hasattr(self, '_last_wall_time') else 0.0
+        
+        # 时间戳
+        metrics_output.timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # 保存
+        metrics_path = os.path.join(output_dir, 'metrics.json')
+        metrics_output.save(metrics_path)
+        
+        # === 2. 构建 case.json ===
+        case_output = CaseOutput()
+        
+        # 配置快照
+        case_output.config = {
+            'map_config_path': self.map_config_path,
+            'model_config_path': self.model_config_path,
+            'control_dt': self.control_dt,
+            'dynamics_dt': self.dynamics_dt,
+            'seed': self.seed
+        }
+        
+        # 障碍物/禁飞区
+        for obs in self.map_manager.obstacles:
+            obs_type = obs.__class__.__name__.lower()
+            if obs_type == 'cylinder':
+                case_output.no_fly_zones.append({
+                    'type': 'cylinder',
+                    'center': [float(obs.center[0]), float(obs.center[1])],
+                    'radius': float(obs.radius),
+                    'z_min': float(obs.z_min),
+                    'z_max': float(obs.z_max)
+                })
+            elif obs_type == 'prism':
+                case_output.no_fly_zones.append({
+                    'type': 'polygon',
+                    'vertices': [[float(v[0]), float(v[1])] for v in obs.polygon.vertices],
+                    'z_min': float(obs.z_min),
+                    'z_max': float(obs.z_max)
+                })
+        
+        # 起终点
+        if self.map_manager.start:
+            case_output.start_position = [
+                float(self.map_manager.start.x),
+                float(self.map_manager.start.y),
+                float(self.map_manager.start.z)
+            ]
+        if self.map_manager.target:
+            case_output.target_position = [
+                float(self.map_manager.target.position[0]),
+                float(self.map_manager.target.position[1]),
+                float(self.map_manager.target.position[2])
+            ]
+        
+        # 参考轨迹
+        if self.trajectory:
+            case_output.set_reference_trajectory(self.trajectory)
+        
+        # 实际轨迹和控制数据
+        data = self.log.to_arrays()
+        for i in range(len(data['t'])):
+            case_output.add_trajectory_point(
+                t=data['t'][i],
+                position=data['position'][i],
+                velocity=data['velocity'][i],
+                euler=data['euler'][i],
+                ref_position=data['ref_position'][i],
+                ref_heading=data['ref_heading'][i]
+            )
+            case_output.add_control_point(
+                t=data['t'][i],
+                delta_left=data['delta_left'][i],
+                delta_right=data['delta_right'][i],
+                cross_track_error=data['cross_track_error'][i],
+                heading_error=data['heading_error'][i]
+            )
+        
+        # 添加终止事件
+        if hasattr(self, '_last_termination_reason') and self._last_termination_reason:
+            case_output.add_event(
+                t=self._last_flight_time if hasattr(self, '_last_flight_time') else data['t'][-1],
+                event_type=self._last_termination_reason.value,
+                details={
+                    'final_position': final_pos.tolist() if isinstance(final_pos, np.ndarray) else final_pos
+                }
+            )
+        
+        # 保存
+        case_path = os.path.join(output_dir, 'case.json')
+        case_output.save(case_path)
+        
+        return metrics_path, case_path
+    
+    def _compute_config_hash(self) -> str:
+        """计算配置哈希"""
+        configs = {}
+        
+        # 加载配置文件内容
+        try:
+            with open(self.map_config_path, 'r', encoding='utf-8') as f:
+                configs['map_config'] = yaml.safe_load(f)
+        except:
+            configs['map_config'] = self.map_config_path
+        
+        try:
+            with open(self.model_config_path, 'r', encoding='utf-8') as f:
+                configs['model_config'] = yaml.safe_load(f)
+        except:
+            configs['model_config'] = self.model_config_path
+        
+        # 添加仿真参数
+        configs['sim_config'] = {
+            'control_dt': self.control_dt,
+            'dynamics_dt': self.dynamics_dt
+        }
+        
+        # 添加控制器参数（这里简化处理）
+        configs['controller_config'] = {
+            'type': 'adrc'
+        }
+        
+        # 风场配置
+        configs['disturbance_config'] = {
+            'wind': 'none'
+        }
+        
+        return get_config_hash(configs)
     
     def visualize(self, save_path: str = None):
         """
@@ -966,9 +1366,6 @@ if __name__ == "__main__":
                         help="初始位置噪声 [dx, dy, dz]")
     parser.add_argument("--heading-noise", type=float, default=0.1,
                         help="初始航向噪声 (rad)")
-    parser.add_argument("--planner", type=str, default="kinodynamic",
-                        choices=["old", "kinodynamic"],
-                        help="规划器类型: old=旧RRT*, kinodynamic=新Kinodynamic RRT*")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="输出目录（保存仿真数据 JSON，用于 Web 可视化），目录不存在会自动创建")
     parser.add_argument("--no-plot", action="store_true",
@@ -984,10 +1381,7 @@ if __name__ == "__main__":
     )
 
     # 规划
-    if args.planner == "kinodynamic":
-        success = sim.plan_kinodynamic(max_time=30.0)
-    else:
-        success = sim.plan(max_time=30.0)
+    success = sim.plan(max_time=30.0)
 
     if not success:
         exit(1)
