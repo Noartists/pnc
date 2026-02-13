@@ -133,7 +133,7 @@ corridor:
 
 # ---------- 约束参数 ----------
 constraints:
-  min_turn_radius: 50
+  min_turn_radius: 90
   max_bank_angle: 30
   min_altitude: 20           # 最低飞行高度
   terminal_altitude: 50      # 进场高度
@@ -144,7 +144,7 @@ constraints:
 
 # ---------- 轨迹参数 ----------
 trajectory:
-  reference_speed: 9.0    # 参考飞行速度 (m/s)，取10-15范围中值
+  reference_speed: 8.0    # 参考飞行速度 (m/s)，接近实测水平速度7.6m/s
   control_frequency: 100   # 控制频率 (Hz)
   sample_dt: 0.01          # 采样周期 (s) = 1/freq
 

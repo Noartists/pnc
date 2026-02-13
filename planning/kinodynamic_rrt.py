@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 import time
 from tqdm import tqdm
 
+from planning.dubins import DubinsPath
+
 
 @dataclass
 class KinoState:
@@ -19,312 +21,14 @@ class KinoState:
     y: float
     z: float
     heading: float
-    
+
     @property
     def position(self) -> np.ndarray:
         return np.array([self.x, self.y, self.z])
-    
+
     @property
     def pos_2d(self) -> np.ndarray:
         return np.array([self.x, self.y])
-
-
-class DubinsPath:
-    """
-    Dubins曲线计算器
-    
-    连接两个2D位姿 (x, y, heading)，满足最小转弯半径约束。
-    """
-    
-    def __init__(self, turn_radius: float):
-        self.turn_radius = turn_radius
-    
-    def compute(self, start: Tuple[float, float, float], 
-                end: Tuple[float, float, float]) -> Optional[dict]:
-        """
-        计算Dubins曲线
-        
-        参数:
-            start: (x, y, heading) 起点
-            end: (x, y, heading) 终点
-            
-        返回:
-            最优Dubins路径参数，或None（不可达）
-        """
-        x0, y0, h0 = start
-        x1, y1, h1 = end
-        r = self.turn_radius
-        
-        # 转换到局部坐标系
-        dx = x1 - x0
-        dy = y1 - y0
-        D = np.sqrt(dx**2 + dy**2)
-        d = D / r  # 归一化距离
-        
-        if d < 1e-6:
-            return None
-        
-        theta = np.arctan2(dy, dx)
-        alpha = self._normalize_angle(h0 - theta)
-        beta = self._normalize_angle(h1 - theta)
-        
-        # 尝试所有6种Dubins路径类型
-        paths = [
-            self._LSL(alpha, beta, d),
-            self._RSR(alpha, beta, d),
-            self._LSR(alpha, beta, d),
-            self._RSL(alpha, beta, d),
-            self._LRL(alpha, beta, d),
-            self._RLR(alpha, beta, d),
-        ]
-        
-        # 选择最短的有效路径
-        best = None
-        best_len = float('inf')
-        
-        for path in paths:
-            if path is not None and path['length'] < best_len:
-                best = path
-                best_len = path['length']
-        
-        if best is None:
-            return None
-        
-        # 转换回世界坐标
-        best['start'] = start
-        best['end'] = end
-        best['turn_radius'] = r
-        best['length'] *= r  # 实际长度
-        
-        return best
-    
-    def sample(self, path: dict, num_points: int = 20) -> List[np.ndarray]:
-        """
-        沿Dubins曲线采样点
-        
-        返回:
-            2D点列表 [(x, y), ...]
-        """
-        if path is None:
-            return []
-        
-        x0, y0, h0 = path['start']
-        r = path['turn_radius']
-        segments = path['segments']  # [(length, direction), ...]
-        
-        points = []
-        x, y, h = x0, y0, h0
-        
-        total_len = sum(s[0] for s in segments)
-        step = total_len / (num_points - 1) if num_points > 1 else total_len
-        
-        accumulated = 0.0
-        seg_idx = 0
-        seg_progress = 0.0
-        
-        for i in range(num_points):
-            target_dist = i * step
-            
-            # 前进到目标距离
-            while accumulated + (segments[seg_idx][0] * r - seg_progress) < target_dist and seg_idx < len(segments) - 1:
-                # 完成当前段
-                seg_len, direction = segments[seg_idx]
-                remaining = seg_len * r - seg_progress
-                
-                if direction == 'S':  # 直线
-                    x += remaining * np.cos(h)
-                    y += remaining * np.sin(h)
-                elif direction == 'L':  # 左转
-                    dtheta = remaining / r
-                    cx = x - r * np.sin(h)
-                    cy = y + r * np.cos(h)
-                    h += dtheta
-                    x = cx + r * np.sin(h)
-                    y = cy - r * np.cos(h)
-                elif direction == 'R':  # 右转
-                    dtheta = remaining / r
-                    cx = x + r * np.sin(h)
-                    cy = y - r * np.cos(h)
-                    h -= dtheta
-                    x = cx - r * np.sin(h)
-                    y = cy + r * np.cos(h)
-                
-                accumulated += remaining
-                seg_progress = 0.0
-                seg_idx += 1
-            
-            # 在当前段内前进
-            if seg_idx < len(segments):
-                seg_len, direction = segments[seg_idx]
-                advance = target_dist - accumulated
-                
-                if direction == 'S':
-                    px = x + advance * np.cos(h)
-                    py = y + advance * np.sin(h)
-                elif direction == 'L':
-                    dtheta = advance / r
-                    cx = x - r * np.sin(h)
-                    cy = y + r * np.cos(h)
-                    px = cx + r * np.sin(h + dtheta)
-                    py = cy - r * np.cos(h + dtheta)
-                elif direction == 'R':
-                    dtheta = advance / r
-                    cx = x + r * np.sin(h)
-                    cy = y - r * np.cos(h)
-                    px = cx - r * np.sin(h - dtheta)
-                    py = cy + r * np.cos(h - dtheta)
-                
-                points.append(np.array([px, py]))
-            else:
-                points.append(np.array([x, y]))
-        
-        return points
-    
-    def _normalize_angle(self, angle: float) -> float:
-        """归一化角度到 [-pi, pi]"""
-        while angle > np.pi:
-            angle -= 2 * np.pi
-        while angle < -np.pi:
-            angle += 2 * np.pi
-        return angle
-    
-    def _LSL(self, alpha: float, beta: float, d: float) -> Optional[dict]:
-        """Left-Straight-Left"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-        
-        tmp = 2 + d**2 - 2*(ca*cb + sa*sb - d*(sa - sb))
-        if tmp < 0:
-            return None
-        
-        p = np.sqrt(tmp)
-        theta = np.arctan2(cb - ca, d + sa - sb)
-        t = self._normalize_angle(-alpha + theta)
-        q = self._normalize_angle(beta - theta)
-        
-        if t < 0 or q < 0:
-            return None
-        
-        return {
-            'type': 'LSL',
-            'segments': [(t, 'L'), (p, 'S'), (q, 'L')],
-            'length': t + p + q
-        }
-    
-    def _RSR(self, alpha: float, beta: float, d: float) -> Optional[dict]:
-        """Right-Straight-Right"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-        
-        tmp = 2 + d**2 - 2*(ca*cb + sa*sb - d*(sb - sa))
-        if tmp < 0:
-            return None
-        
-        p = np.sqrt(tmp)
-        theta = np.arctan2(ca - cb, d - sa + sb)
-        t = self._normalize_angle(alpha - theta)
-        q = self._normalize_angle(-beta + theta)
-        
-        if t < 0 or q < 0:
-            return None
-        
-        return {
-            'type': 'RSR',
-            'segments': [(t, 'R'), (p, 'S'), (q, 'R')],
-            'length': t + p + q
-        }
-    
-    def _LSR(self, alpha: float, beta: float, d: float) -> Optional[dict]:
-        """Left-Straight-Right"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-        
-        tmp = -2 + d**2 + 2*(ca*cb + sa*sb + d*(sa + sb))
-        if tmp < 0:
-            return None
-        
-        p = np.sqrt(tmp)
-        theta = np.arctan2(-ca - cb, d + sa + sb) - np.arctan2(-2, p)
-        t = self._normalize_angle(-alpha + theta)
-        q = self._normalize_angle(-beta + theta)
-        
-        if t < 0 or q < 0:
-            return None
-        
-        return {
-            'type': 'LSR',
-            'segments': [(t, 'L'), (p, 'S'), (q, 'R')],
-            'length': t + p + q
-        }
-    
-    def _RSL(self, alpha: float, beta: float, d: float) -> Optional[dict]:
-        """Right-Straight-Left"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-        
-        tmp = -2 + d**2 + 2*(ca*cb + sa*sb - d*(sa + sb))
-        if tmp < 0:
-            return None
-        
-        p = np.sqrt(tmp)
-        theta = np.arctan2(ca + cb, d - sa - sb) - np.arctan2(2, p)
-        t = self._normalize_angle(alpha - theta)
-        q = self._normalize_angle(beta - theta)
-        
-        if t < 0 or q < 0:
-            return None
-        
-        return {
-            'type': 'RSL',
-            'segments': [(t, 'R'), (p, 'S'), (q, 'L')],
-            'length': t + p + q
-        }
-    
-    def _LRL(self, alpha: float, beta: float, d: float) -> Optional[dict]:
-        """Left-Right-Left"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-        
-        tmp = (6 - d**2 + 2*(ca*cb + sa*sb + d*(sa - sb))) / 8
-        if abs(tmp) > 1:
-            return None
-        
-        p = np.arccos(tmp)
-        theta = np.arctan2(ca - cb, d + sa - sb)
-        t = self._normalize_angle(-alpha + theta + p/2)
-        q = self._normalize_angle(beta - theta + p/2)
-        
-        if t < 0 or q < 0:
-            return None
-        
-        return {
-            'type': 'LRL',
-            'segments': [(t, 'L'), (p, 'R'), (q, 'L')],
-            'length': t + p + q
-        }
-    
-    def _RLR(self, alpha: float, beta: float, d: float) -> Optional[dict]:
-        """Right-Left-Right"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-        
-        tmp = (6 - d**2 + 2*(ca*cb + sa*sb - d*(sa - sb))) / 8
-        if abs(tmp) > 1:
-            return None
-        
-        p = np.arccos(tmp)
-        theta = np.arctan2(ca - cb, d - sa + sb)
-        t = self._normalize_angle(alpha - theta + p/2)
-        q = self._normalize_angle(-beta + theta + p/2)
-        
-        if t < 0 or q < 0:
-            return None
-        
-        return {
-            'type': 'RLR',
-            'segments': [(t, 'R'), (p, 'L'), (q, 'R')],
-            'length': t + p + q
-        }
 
 
 @dataclass
@@ -354,6 +58,12 @@ class KinodynamicRRTStar:
         self.min_turn_radius = map_manager.constraints.min_turn_radius
         self.max_glide = map_manager.constraints.glide_ratio
         self.min_glide = map_manager.constraints.min_glide_ratio
+        # 有效最小滑翔比（考虑航向/下降共享控制预算）
+        # 翼伞弯道时 delta_a 占用大量行程 → delta_s 受限 → 下降能力降低
+        # 整条路径的实际平均滑翔比远高于理论 min_glide
+        # 经验值约 5.0（基于 ~67% 饱和率下的加权平均），
+        # 对比理论中点 4.48 更保守，确保路径长度充足
+        self.effective_min_glide = 5.0
         self.min_altitude = map_manager.constraints.min_altitude
         
         # Dubins曲线计算器
@@ -559,7 +269,7 @@ class KinodynamicRRTStar:
             dist_to_goal = np.linalg.norm(new_state.position[:2] - goal_state.position[:2])
             dz_to_goal = abs(new_state.z - goal_state.z)
 
-            if dist_to_goal < 200 and dz_to_goal < 80:
+            if dist_to_goal < 300 and dz_to_goal < 200:
                 # 尝试用Dubins/直线连接到精确目标点
                 connected = False
                 goal_steer = self._steer(new_state, goal_state)
@@ -590,7 +300,44 @@ class KinodynamicRRTStar:
             pbar.set_postfix_str(f"节点:{len(self.nodes)}, 距目标:{dist_to_goal:.0f}m")
         
         pbar.close()
-        
+
+        # --- 最终尝试：如果主循环未到达目标，从最近节点尝试连接 ---
+        if not goal_reached:
+            candidates = []
+            for ni, node in enumerate(self.nodes):
+                d2d = np.linalg.norm(
+                    node.state.position[:2] - goal_state.position[:2])
+                candidates.append((d2d, ni))
+            candidates.sort()
+
+            for d2d, ni in candidates[:50]:
+                if d2d > 500:
+                    break
+                n_node = self.nodes[ni]
+                gs = self._steer(n_node.state, goal_state)
+                if gs is None:
+                    continue
+                gs_state, gs_path = gs
+                gs_dist = np.linalg.norm(
+                    gs_state.position[:2] - goal_state.position[:2])
+                if gs_dist < 100 and not self._has_collision_path(gs_path):
+                    gs_len = sum(
+                        np.linalg.norm(gs_path[j+1] - gs_path[j])
+                        for j in range(len(gs_path)-1))
+                    gs_cost = n_node.cost + gs_len
+                    gs_node = KinoNode(gs_state, ni, gs_cost)
+                    gs_idx = len(self.nodes)
+                    self.nodes.append(gs_node)
+                    self.edge_paths[(ni, gs_idx)] = gs_path
+                    if gs_cost < best_cost:
+                        best_cost = gs_cost
+                        best_idx = gs_idx
+                        goal_reached = True
+                        if not self.quiet:
+                            print(f"  [最终连接] 从节点{ni}成功, "
+                                  f"2D距离={d2d:.0f}m")
+                        break
+
         # 打印统计
         if not self.quiet:
             print(f"\n  === 统计 ===")
@@ -616,17 +363,30 @@ class KinodynamicRRTStar:
                 print(f"  [失败] 未到达目标")
             return None, {'success': False, 'stats': stats}
 
-        # 提取路径
+        # 提取路径（此时高度是 _steer 中用名义滑翔比粗算的，需要重分配）
         path = self._extract_path(best_idx)
         path.append(goal)  # 添加终点
 
-        # --- 后处理：如果终点高度过高，注入螺旋下降段 ---
-        path = self._inject_spiral_descent(path, goal, goal_state.heading)
+        # 提取节点链（供后处理器使用）
+        node_chain = self._extract_node_chain(best_idx)
+
+        # --- 后处理：基于实际路径长度重新分配高度 ---
+        z_start = start[2]
+        z_goal = goal[2]
+        path, actual_glide = self._reassign_altitude(
+            path, z_start, z_goal, goal_state.heading
+        )
 
         if not self.quiet:
-            print(f"  [成功] 路径点数: {len(path)}")
+            print(f"  [成功] 路径点数: {len(path)}, 实际滑翔比: {actual_glide:.2f}")
 
-        return path, {'success': True, 'stats': stats, 'path_length': best_cost}
+        return path, {
+            'success': True,
+            'stats': stats,
+            'path_length': best_cost,
+            'edge_paths': self.edge_paths,
+            'node_chain': node_chain,
+        }
     
     def _random_sample(self, z_max: float, z_min: float, goal: np.ndarray) -> KinoState:
         """
@@ -655,23 +415,29 @@ class KinodynamicRRTStar:
             return KinoState(x, y, z, heading)
 
         elif r < 4.0 / 7.0:
-            # 引导式采样：z坐标与alpha（到目标进度）关联
+            # 引导式采样：z坐标基于滑翔比可行锥
             alpha = np.random.uniform(0.2, 1.0)
             start = np.array([self.map.start.x, self.map.start.y, self.map.start.z])
 
-            # 基础位置（z与进度线性关联）
             base_x = start[0] + alpha * (goal[0] - start[0])
             base_y = start[1] + alpha * (goal[1] - start[1])
-            base_z = start[2] + alpha * (goal[2] - start[2])
-
-            # 添加随机偏移（z偏移较小，保持与进度关联）
             x = base_x + np.random.uniform(-200, 200)
             y = base_y + np.random.uniform(-200, 200)
-            z = base_z + np.random.uniform(-20, 20)
-
             x = np.clip(x, bounds['x_min'], bounds['x_max'])
             y = np.clip(y, bounds['y_min'], bounds['y_max'])
-            z = np.clip(z, max(z_min, 0.0), z_max)
+
+            # z 基于到目标的剩余2D距离和滑翔比可行锥
+            # 使用 effective_min_glide（考虑控制预算共享），
+            # 避免采样到物理上不可达的高度范围
+            remaining = np.linalg.norm(np.array([x, y]) - goal[:2])
+            z_low = goal[2] + remaining / self.max_glide
+            z_high = goal[2] + remaining / self.effective_min_glide
+            z_high = min(z_high, z_max)
+            z_low = max(z_low, max(z_min, 0.0))
+            if z_low <= z_high:
+                z = np.random.uniform(z_low, z_high)
+            else:
+                z = z_low
         else:
             # 完全随机采样
             x = np.random.uniform(bounds['x_min'], bounds['x_max'])
@@ -779,25 +545,26 @@ class KinodynamicRRTStar:
                 else:
                     new_heading = target_heading
 
-        # --- 目标感知的下降量计算 ---
-        # 根据"从当前节点到目标还需要什么滑翔比"来决定下降率
-        remaining_h = np.linalg.norm(
-            np.array([from_s.x, from_s.y]) - self._goal_xy)
-        remaining_v = from_s.z - self._goal_z
+        # --- 自适应下降率：根据当前节点到目标的剩余距离动态调整 ---
+        end_pt = path_2d[-1]
+        remaining_2d = np.linalg.norm(
+            np.array([end_pt[0], end_pt[1]]) - self._goal_xy)
+        altitude_above_goal = from_s.z - self._goal_z
 
-        if remaining_v > 1.0:
-            budget_glide = remaining_h / remaining_v
+        if altitude_above_goal > 1.0 and remaining_2d > 1.0:
+            # 当前位置飞到目标所需的滑翔比，留 10% 余量
+            needed_glide = remaining_2d / altitude_above_goal
+            # 使用 effective_min_glide 作为下限，确保分配到的下降率
+            # 在控制预算共享约束下物理可达
+            adaptive_glide = np.clip(needed_glide * 1.1,
+                                     self.effective_min_glide, self.max_glide)
         else:
-            budget_glide = self.max_glide
+            # 已在目标正上方或高度极低，用有效最小滑翔比下降
+            adaptive_glide = self.effective_min_glide
 
-        # 目标滑翔比 = 预算滑翔比 clamped 到物理范围
-        target_glide = np.clip(budget_glide, self.min_glide, self.max_glide)
-
-        # 下降量 = 弧长 / 目标滑翔比，再 clamp 到物理极限
-        descent = path_len / target_glide
-        # 物理极限：不能比 max_glide 下降更少，不能比 min_glide 下降更多
+        descent = path_len / adaptive_glide
         min_descent = path_len / self.max_glide
-        max_descent = path_len / self.min_glide
+        max_descent = path_len / self.effective_min_glide
         descent = np.clip(descent, min_descent, max_descent)
 
         new_z = from_s.z - descent
@@ -846,7 +613,7 @@ class KinodynamicRRTStar:
     def _extract_path(self, goal_idx: int) -> List[np.ndarray]:
         """
         提取平滑路径
-        
+
         利用存储的Dubins路径点，输出平滑的路径
         """
         # 先提取节点索引链
@@ -856,13 +623,13 @@ class KinodynamicRRTStar:
             indices.append(idx)
             idx = self.nodes[idx].parent
         indices.reverse()
-        
+
         # 拼接路径点
         path = []
         for i in range(len(indices) - 1):
             parent_idx = indices[i]
             child_idx = indices[i + 1]
-            
+
             edge_key = (parent_idx, child_idx)
             if edge_key in self.edge_paths:
                 edge_path = self.edge_paths[edge_key]
@@ -874,12 +641,30 @@ class KinodynamicRRTStar:
             else:
                 # 没有存储的路径，直接用节点位置
                 path.append(self.nodes[parent_idx].state.position.copy())
-        
+
         # 确保最后一个节点在路径中
         if len(path) == 0 or not np.allclose(path[-1], self.nodes[goal_idx].state.position):
             path.append(self.nodes[goal_idx].state.position.copy())
-        
+
         return path
+
+    def _extract_node_chain(self, goal_idx: int) -> List[Tuple[int, int]]:
+        """
+        提取有序的边键列表 [(parent_idx, child_idx), ...]
+
+        与 _extract_path 逻辑类似，但返回节点索引对而非路径点。
+        """
+        indices = []
+        idx = goal_idx
+        while idx is not None:
+            indices.append(idx)
+            idx = self.nodes[idx].parent
+        indices.reverse()
+
+        chain = []
+        for i in range(len(indices) - 1):
+            chain.append((indices[i], indices[i + 1]))
+        return chain
 
     def export_to_json(self, output_dir: str = None, path: List[np.ndarray] = None, 
                        path_length: float = None) -> str:
@@ -982,84 +767,64 @@ class KinodynamicRRTStar:
             print(f"  数据已导出: {filepath}")
         return filepath
 
-    def _inject_spiral_descent(self, path: List[np.ndarray], goal: np.ndarray,
-                                goal_heading: float) -> List[np.ndarray]:
-        """
-        后处理：当路径末段的滑翔比低于 min_glide（下降过陡，高度远多于水平距离
-        能消耗的量）时，在目标附近注入螺旋下降段消掉多余高度。
+    # ================================================================
+    #  后处理：高度重分配（核心改进）
+    # ================================================================
 
-        只消掉"多余"的高度，即正常以 min_glide 滑过去消不掉的那部分。
+    def _reassign_altitude(self, path: List[np.ndarray],
+                           z_start: float, z_goal: float,
+                           goal_heading: float) -> Tuple[List[np.ndarray], float]:
+        """
+        基于实际 2D 路径长度，重新分配高度剖面（线性分配）。
+
+        螺旋消高已移至后处理器 (_inject_spiral_dubins)，
+        此处仅做粗略的线性 z 分配供规划器输出。
+
+        返回:
+            (path, actual_glide_ratio)
         """
         if len(path) < 2:
-            return path
+            return path, 0.0
 
-        # 取路径倒数第二个点（螺旋插入点）到目标的关系
-        # path[-1] 是 goal 本身，取 path[-2] 作为"到达目标前的最后一个路径点"
-        entry_pt = path[-2] if len(path) >= 2 else path[-1]
+        delta_z = z_start - z_goal
+        if delta_z <= 0:
+            return path, float('inf')
 
-        h_dist = np.linalg.norm(entry_pt[:2] - goal[:2])
-        v_dist = entry_pt[2] - goal[2]
+        # 计算 2D 路径总长
+        total_len_2d = self._path_length_2d(path)
 
-        if v_dist <= 0:
-            return path  # 不需要下降
+        if total_len_2d < 1.0:
+            return path, 0.0
 
-        needed_glide = h_dist / v_dist if v_dist > 1e-6 else float('inf')
-
-        # 如果滑翔比 >= min_glide，正常滑翔就能到达，不需要盘旋
-        if needed_glide >= self.min_glide:
-            return path
-
-        # 多余高度 = 总高度差 - 以 min_glide 飞完水平距离能消耗的高度
-        consumable_alt = h_dist / self.min_glide
-        excess_alt = v_dist - consumable_alt
-
-        if excess_alt < 10.0:
-            return path  # 多余量太小，忽略
+        required_glide = total_len_2d / delta_z
 
         if not self.quiet:
-            print(f"  [后处理] 滑翔比 {needed_glide:.2f} < min_glide {self.min_glide:.2f}，"
-                  f"需螺旋消高 {excess_alt:.1f}m")
+            print(f"  [高度重分配] 2D路径长={total_len_2d:.0f}m, "
+                  f"高度差={delta_z:.0f}m, 所需滑翔比={required_glide:.2f}, "
+                  f"有效最小滑翔比={self.effective_min_glide:.2f}")
 
-        # 螺旋参数
-        loiter_radius = self.min_turn_radius * 1.5
-        glide_for_spiral = self.max_glide  # 螺旋时用最大滑翔比（最缓下降率）
+        # 线性分配高度（按 2D 距离比例）
+        cum_dist = 0.0
+        path[0][2] = z_start
+        for i in range(1, len(path)):
+            seg_len = np.linalg.norm(path[i][:2] - path[i - 1][:2])
+            cum_dist += seg_len
+            frac = cum_dist / total_len_2d if total_len_2d > 0 else 1.0
+            frac = min(frac, 1.0)
+            path[i][2] = z_start - frac * delta_z
 
-        # 螺旋消掉 excess_alt 所需的水平飞行距离
-        h_needed = excess_alt * glide_for_spiral
-        circumference = 2 * np.pi * loiter_radius
-        num_loops = h_needed / circumference
+        # 确保终点精确
+        path[-1][2] = z_goal
 
-        # 螺旋中心在目标附近
-        cx, cy = goal[0], goal[1]
+        return path, required_glide
 
-        # 生成螺旋点
-        points_per_loop = 20
-        total_points = max(int(num_loops * points_per_loop), 10)
-        total_angle = num_loops * 2 * np.pi
-
-        spiral_path = []
-        start_z = entry_pt[2]
-        start_angle = np.arctan2(entry_pt[1] - cy, entry_pt[0] - cx)
-
-        for k in range(total_points + 1):
-            frac = k / total_points
-            angle = start_angle - frac * total_angle  # 顺时针
-            x = cx + loiter_radius * np.cos(angle)
-            y = cy + loiter_radius * np.sin(angle)
-            z = start_z - frac * excess_alt  # 只消掉多余高度
-            spiral_path.append(np.array([x, y, z]))
-
-        # 检查螺旋段碰撞
-        if self._has_collision_path(spiral_path):
-            if not self.quiet:
-                print(f"  [后处理] 螺旋段有碰撞，跳过注入")
-            return path
-
-        # 拼接：path[:-1]（去掉goal） + 螺旋段 + goal
-        # 螺旋结束后高度 = entry_pt.z - excess_alt = goal.z + consumable_alt
-        # 此时从螺旋终点到goal的滑翔比 ≈ min_glide，可以正常滑到
-        result = path[:-1] + spiral_path + [goal]
-        return result
+    @staticmethod
+    def _path_length_2d(path: List[np.ndarray]) -> float:
+        """计算路径的 2D 总长度"""
+        total = 0.0
+        for i in range(len(path) - 1):
+            total += np.linalg.norm(path[i + 1][:2] - path[i][:2])
+        return total
 
 
 if __name__ == "__main__":

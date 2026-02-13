@@ -2,6 +2,7 @@
 trajectory_dataset/
 visualization/data/
 benchmark/outputs/
+paper/
 
 # ==================== Python ====================
 __pycache__/
@@ -35,6 +36,7 @@ ENV/
 # ==================== IDE ====================
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 *~

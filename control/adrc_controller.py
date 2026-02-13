@@ -502,6 +502,7 @@ class ControlOutput:
     glide_ratio_current: float = 0.0   # 当前滑翔比
     ref_heading: float = 0.0       # 参考航向 (rad)
     ref_position: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    ref_position_closest: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
 
 class ParafoilADRCController:
@@ -567,7 +568,14 @@ class ParafoilADRCController:
         # 航向ADRC控制器
         # b0: 控制增益估计值，需要根据系统特性调整
         # 翼伞通过滚转转弯，航向响应较慢，b0应该较大以避免过度控制
-        b0_heading = 2.0  # 适中的b0，避免控制输出过大
+        # b0: 控制增益估计值
+        # 翼伞最大偏航率仅 ~6.5°/s，航向响应带宽极低
+        # b0 过小→有效增益过大→控制器慢性饱和→挤占下降通道
+        # b0=1.5 时：kp/b0=1.0，57° 误差即饱和（saturation >88%）
+        # b0=3.5 时：kp/b0=0.43，太保守，偏航响应不足
+        # b0=3.0 时：kp/b0=0.5，115° 误差才饱和 → 更少控制预算占用
+        # 给对称偏转(下降控制)留出更多余量
+        b0_heading = 3.0
 
         self.heading_adrc = ADRC(
             td_r=heading_td_r,    # TD快速因子：越小过渡越平滑
@@ -664,8 +672,8 @@ class ParafoilADRCController:
         base_glide_ratio = self.glide_ratio_natural
 
         # 根据高度误差调整目标滑翔比
-        # 每10m高度误差，调整滑翔比±1
-        glide_ratio_adjustment = -altitude_error / 10.0
+        # 每6m高度误差，调整滑翔比±1 (24m误差即请求最大下降)
+        glide_ratio_adjustment = -altitude_error / 6.0
         glide_ratio_required = base_glide_ratio + glide_ratio_adjustment
 
         # 限制在合理范围内
@@ -702,60 +710,80 @@ class ParafoilADRCController:
     
     def _find_closest_point(self, current_pos: np.ndarray) -> int:
         """
-        找到轨迹上距离当前位置最近的点索引
-        
-        参数:
-            current_pos: 当前位置 [x, y, z]
-        
-        返回:
-            最近点索引
+        找到轨迹上距离当前位置最近的点索引 (2D水平面距离)
+
+        两阶段搜索:
+        1. 小窗口 (±20索引) 围绕期望位置搜索 → 快速、防止螺旋段跳跃
+        2. 若距离 >30m，扩大搜索范围 → 处理初始偏差和大扰动
         """
         if self.trajectory is None or len(self.trajectory) == 0:
             return 0
-        
-        # 从当前索引开始向前搜索
+
+        # Phase 1: 小窗口搜索（基于速度的期望前进量）
+        expected_next = self.current_index + 1
+        search_start = max(0, expected_next - 20)
+        search_end = min(len(self.trajectory), expected_next + 20)
+
         min_dist = np.inf
         best_idx = self.current_index
-        
-        # 搜索范围: 当前索引前后一定范围
-        search_start = max(0, self.current_index - 10)
-        search_end = min(len(self.trajectory), self.current_index + 100)
-        
+
         for i in range(search_start, search_end):
-            dist = np.linalg.norm(current_pos - self.trajectory[i].position)
+            dist = np.linalg.norm(current_pos[:2] - self.trajectory[i].position[:2])
             if dist < min_dist:
                 min_dist = dist
                 best_idx = i
-        
-        # 只允许索引向前移动，避免回退
-        return max(best_idx, self.current_index)
+
+        # Phase 2: 若匹配差（>30m），扩大搜索范围（仅向前搜索，禁止回退）
+        if min_dist > 30.0:
+            search_start2 = max(self.current_index, 0)
+            search_end2 = min(len(self.trajectory), self.current_index + 500)
+            for i in range(search_start2, search_end2):
+                dist = np.linalg.norm(current_pos[:2] - self.trajectory[i].position[:2])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_idx = i
+
+        # 强制单调递增：禁止轨迹索引回退
+        # 在螺旋消高段，空间上距离最近的点可能是已经飞过的点，
+        # 回退会导致控制器原地画圈，cross-track 持续增大直到触发 divergence
+        best_idx = max(best_idx, self.current_index)
+
+        return best_idx
     
     def _find_lookahead_point(self, current_pos: np.ndarray, closest_idx: int):
         """
-        找到前视点 (Pure Pursuit风格)
-        
-        参数:
-            current_pos: 当前位置
-            closest_idx: 最近点索引
-        
-        返回:
-            前视点 (TrajectoryPoint)
+        找到前视点 (Pure Pursuit风格，自适应前视距离)
+
+        弯道自动缩短前视距离以提高跟踪精度，
+        直线段使用标称前视距离以保持平滑性。
         """
         if self.trajectory is None or len(self.trajectory) == 0:
             return None
-        
+
+        # 自适应前视距离：基于最近点的曲率
+        # 翼伞是慢响应系统（最大偏航率 ~6.5°/s），弯道时需要更长前视
+        # 以便提前感知转弯方向，给控制器充足反应时间
+        curvature = self.trajectory[closest_idx].curvature
+        if curvature > 0.001:
+            # 弯道：增加前视距离，最大 2 倍标称值
+            scale = 1.0 + min(curvature * self.min_turn_radius, 1.0)
+            effective_la = min(self.lookahead_distance * scale,
+                              self.lookahead_distance * 2.0)
+        else:
+            effective_la = self.lookahead_distance
+
         # 从最近点开始，找到距离超过前视距离的点
         accumulated_dist = 0.0
-        
+
         for i in range(closest_idx, len(self.trajectory) - 1):
             segment_length = np.linalg.norm(
                 self.trajectory[i + 1].position - self.trajectory[i].position
             )
             accumulated_dist += segment_length
-            
-            if accumulated_dist >= self.lookahead_distance:
+
+            if accumulated_dist >= effective_la:
                 return self.trajectory[i + 1]
-        
+
         # 如果没找到，返回轨迹终点
         return self.trajectory[-1]
     
@@ -782,80 +810,52 @@ class ParafoilADRCController:
         # ========== 1. 找到轨迹上的参考点 ==========
         self.current_index = self._find_closest_point(current_pos)
         closest_point = self.trajectory[self.current_index]
-        
-        # 计算横向误差（用于判断是否需要优先回到轨迹）
-        ref_dir_temp = np.array([np.cos(closest_point.heading), np.sin(closest_point.heading)])
-        to_vehicle_temp = current_pos[:2] - closest_point.position[:2]
-        cross_track_error_temp = ref_dir_temp[0] * to_vehicle_temp[1] - ref_dir_temp[1] * to_vehicle_temp[0]
-        
-        # 如果横向误差过大（>50m），优先回到轨迹，使用最近点而非前视点
-        if abs(cross_track_error_temp) > 50.0:
-            # 使用最近点，直接指向轨迹
-            target_pos = closest_point.position
-            target_heading = closest_point.heading
+
+        # Pure Pursuit 前视点
+        lookahead_point = self._find_lookahead_point(current_pos, self.current_index)
+        if lookahead_point is None:
+            lookahead_point = closest_point
+
+        dx = lookahead_point.position[0] - current_pos[0]
+        dy = lookahead_point.position[1] - current_pos[1]
+        dist_to_lookahead = np.sqrt(dx**2 + dy**2)
+
+        if dist_to_lookahead > 1.0:
+            target_heading = np.arctan2(dy, dx)
         else:
-            # 正常情况：使用前视点
-            lookahead_point = self._find_lookahead_point(current_pos, self.current_index)
-            if lookahead_point is None:
-                lookahead_point = closest_point
-            target_pos = lookahead_point.position
-            target_heading = lookahead_point.heading
-        
-        output.ref_position = target_pos.copy()
+            target_heading = closest_point.heading
+
+        # ref_position 使用最近点（用于 ADE 等指标计算）
+        output.ref_position = closest_point.position.copy()
+        output.ref_position_closest = closest_point.position.copy()
         output.ref_heading = target_heading
         
         # ========== 2. 计算跟踪误差 ==========
-        # 2.1 航向误差 (处理 ±π 跳变，选择最短路径)
-        raw_heading_error = target_heading - current_heading
-        heading_error = self._wrap_angle(raw_heading_error)
+        heading_error = self._wrap_angle(target_heading - current_heading)
         output.heading_error = heading_error
-        
-        # 检查航向误差是否过大（可能导致控制器饱和）
-        if abs(heading_error) > np.radians(90):
-            # 如果误差超过90度，可能需要检查控制方向
-            pass
-        
-        # 2.2 高度误差
+
+        # 高度误差
         output.altitude_error = closest_point.position[2] - current_pos[2]
-        
-        # 2.3 横向误差 (Cross-track error)
-        # 使用最近点的切线方向计算
+
+        # 横向误差 (Cross-track error) — 仅用于指标记录和失败检测
         ref_dir = np.array([np.cos(closest_point.heading), np.sin(closest_point.heading)])
         to_vehicle = current_pos[:2] - closest_point.position[:2]
-        
-        # 横向误差: 正值表示飞机在轨迹右侧
         cross_track_error = ref_dir[0] * to_vehicle[1] - ref_dir[1] * to_vehicle[0]
         output.cross_track_error = cross_track_error
-        
-        # 2.4 纵向误差 (Along-track error)
+
         along_track_error = np.dot(to_vehicle, ref_dir)
         output.along_track_error = along_track_error
-        
-        # ========== 3. 航向控制 (ADRC + 横向误差补偿) ==========
-        # 根据横向误差调整目标航向
-        # 横向误差为正：在轨迹右侧，需要左转（减小航向）
-        # 横向误差为负：在轨迹左侧，需要右转（增大航向）
-        
-        # 限制横向误差的影响范围，避免过度修正
-        # 当横向误差很大时，使用饱和函数而非线性增益
-        max_cross_track = 100.0  # 最大有效横向误差 (m)
-        normalized_cross_track = np.clip(cross_track_error / max_cross_track, -1.0, 1.0)
-        
-        # 使用饱和函数，避免大误差时的过度修正
-        heading_correction = self.lateral_kp * max_cross_track * normalized_cross_track
-        heading_correction = np.clip(heading_correction, -np.radians(30), np.radians(30))  # 限制在30度以内
-        
-        adjusted_heading_ref = target_heading - heading_correction  # 负号:右偏需左转
-        
-        # 如果航向误差过大，先限制调整后的目标航向，避免控制器饱和
-        # 当误差超过45度时，逐步调整目标航向（更激进的限制）
+
+        # ========== 3. 航向控制 (ADRC + Pure Pursuit) ==========
+        # Pure Pursuit 已通过几何关系隐式包含横向误差修正，
+        # 无需额外的 lateral_kp/lateral_kd 补偿
+        adjusted_heading_ref = target_heading
+
+        # 限制航向参考与当前航向的偏差，防止控制器饱和
         adjusted_error = self._wrap_angle(adjusted_heading_ref - current_heading)
-        if abs(adjusted_error) > np.radians(45):
-            # 限制调整速度：每次最多调整45度
-            max_adjustment = np.radians(45)
-            adjusted_heading_ref = current_heading + np.sign(adjusted_error) * max_adjustment
-        
-        # 归一化调整后的目标航向到 [-π, π]
+        if abs(adjusted_error) > np.radians(60):
+            adjusted_heading_ref = current_heading + np.sign(adjusted_error) * np.radians(60)
+
         adjusted_heading_ref = self._wrap_angle(adjusted_heading_ref)
         
         # ADRC航向控制（确保输入都在 [-π, π] 范围内）
@@ -906,25 +906,17 @@ class ParafoilADRCController:
         output.delta_right = delta_right
         
         # 调试输出
-        if self.debug and self.debug_counter % 100 == 0:  # 每100步打印一次
+        if self.debug and self.debug_counter % 100 == 0:
             print(f"[控制器调试] step={self.debug_counter}")
             print(f"  当前位置: ({current_pos[0]:.1f}, {current_pos[1]:.1f}, {current_pos[2]:.1f})")
             print(f"  当前航向: {np.degrees(current_heading):.1f}°")
-            print(f"  目标航向: {np.degrees(target_heading):.1f}°")
+            print(f"  Pure Pursuit航向: {np.degrees(target_heading):.1f}°")
             print(f"  航向误差: {np.degrees(heading_error):.1f}°")
-            print(f"  横向误差: {cross_track_error:.2f}m (修正: {np.degrees(heading_correction):.2f}°)")
-            print(f"  调整后目标航向: {np.degrees(adjusted_heading_ref):.1f}°")
-            print(f"  调整后航向误差: {np.degrees(self._wrap_angle(adjusted_heading_ref - current_heading)):.1f}°")
-            print(f"  ADRC输出: {delta_diff:.3f} (范围: [-{self.max_deflection:.1f}, {self.max_deflection:.1f}])")
+            print(f"  横向误差: {cross_track_error:.2f}m")
+            print(f"  ADRC输出: {delta_diff:.3f}")
             print(f"  左绳: {delta_left:.3f}, 右绳: {delta_right:.3f}")
             if abs(delta_diff) >= self.max_deflection * 0.95:
-                print(f"  [警告] ADRC输出饱和! 航向误差: {np.degrees(heading_error):.1f}°")
-                # 检查ADRC内部状态
-                if hasattr(self.heading_adrc, 'td') and hasattr(self.heading_adrc, 'eso'):
-                    td_v1, td_v2 = self.heading_adrc.td.v1, self.heading_adrc.td.v2
-                    eso_z = self.heading_adrc.eso.z
-                    print(f"    TD输出: v1={np.degrees(td_v1):.1f}°, v2={np.degrees(td_v2):.1f}°/s")
-                    print(f"    ESO状态: z1={np.degrees(eso_z[0]):.1f}°, z2={np.degrees(eso_z[1]):.1f}°/s, z3={eso_z[2]:.3f}")
+                print(f"  [警告] ADRC输出饱和!")
         
         self.debug_counter += 1
         
@@ -959,17 +951,13 @@ class ParafoilADRCController:
         )
 
         # 2. 计算下降率控制 (对称偏转)
-        # 使用航向控制中已经计算好的参考位置（前视点），而不是终点
-        target_pos = output.ref_position
+        target_pos = output.ref_position_closest
         delta_s, glide_required, glide_current = self.compute_symmetric_deflection(
             current_pos=current_pos,
             current_vel=current_vel,
-            target_pos=target_pos  # 传入前视点
+            target_pos=target_pos
         )
 
-        output.delta_symmetric = delta_s
-        output.glide_ratio_required = glide_required
-        output.glide_ratio_current = glide_current
 
         # 3. 合成最终控制量
         # 对称偏转 d_s = min(left, right): 控制下降率
@@ -981,8 +969,27 @@ class ParafoilADRCController:
         delta_a = output.delta_asymmetric  # 航向控制的非对称分量
         delta_a_abs = abs(delta_a)
 
-        # 限制对称偏转，为非对称偏转留出空间
-        # max_deflection = d_s + |d_a|，所以 d_s <= max_deflection - |d_a|
+        # ====== 进度自适应对称/非对称偏转预算分配 ======
+        # 根据飞行进度动态调整对称偏转(下降控制)的最低预算：
+        #   前半程 (<0.5): 20% → 允许足够航向修正
+        #   中段 (0.5~0.8): 30% → 平衡航向与下降
+        #   末段 (>0.8): 50% → 高度收敛优先
+        #   末端下降 (>0.95): 70% → 全力下降收敛
+        progress = self.get_progress()
+        if progress > 0.95:
+            budget_ratio = 0.70
+        elif progress > 0.8:
+            budget_ratio = 0.50
+        elif progress > 0.5:
+            budget_ratio = 0.30
+        else:
+            budget_ratio = 0.20
+        min_symmetric_budget = budget_ratio * self.max_deflection
+        max_asymmetric = self.max_deflection - min_symmetric_budget
+        delta_a_abs = min(delta_a_abs, max_asymmetric)      # 限制非对称上限
+        delta_a = np.sign(delta_a) * delta_a_abs if delta_a != 0 else 0.0
+        output.delta_asymmetric = delta_a                    # 更新实际使用值
+
         max_symmetric = self.max_deflection - delta_a_abs
         delta_s_limited = np.clip(delta_s, 0, max(0, max_symmetric))
 

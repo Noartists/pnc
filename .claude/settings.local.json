@@ -1,7 +1,17 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(dir:*)",
+      "Bash(cd:*)",
+      "Bash(ls -la \"D:\\\\IROS\\\\pnc\\\\control\"\" 2>/dev/null || echo \"Directory access issue \")",
+      "Bash(where:*)",
+      "Bash(D:miniconda3envs*python.exe)",
+      "Bash(D:\\\\miniconda3\\\\python.exe:*)",
+      "Bash(\"D:/miniconda3/envs/myenv/python.exe\" -c:*)",
+      "Bash(\"D:/miniconda3/envs/myenv/python.exe\" -m benchmark.runner --seeds 1 --scene default --output-dir benchmark/outputs/test_pure_pursuit)",
+      "Bash(\"D:/miniconda3/envs/myenv/python.exe\" -m benchmark.runner:*)",
+      "Bash(find:*)"
     ]
   }
 }

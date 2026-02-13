@@ -154,7 +154,15 @@ class BenchmarkRunner:
             sim.init_state(use_rng=True)
             
             # 运行仿真（使用回调更新进度）
-            max_time = self.config.max_sim_time
+            # 动态计算 max_time: 轨迹时长 + 60s 余量
+            try:
+                traj_duration = sim.trajectory.duration if hasattr(sim.trajectory, 'duration') else 0.0
+                if traj_duration > 0:
+                    max_time = traj_duration + 60.0
+                else:
+                    max_time = self.config.max_sim_time
+            except Exception:
+                max_time = self.config.max_sim_time
             
             def progress_callback(t: float, progress: float):
                 """仿真进度回调"""
@@ -354,21 +362,21 @@ class BenchmarkRunner:
         # 成功率条
         bar_len = 40
         filled = int(bar_len * success_rate / 100)
-        bar = "█" * filled + "░" * (bar_len - filled)
+        bar = "#" * filled + "-" * (bar_len - filled)
         print(f"║  Success Rate: [{bar}] {success_rate:5.1f}%  ║")
         
         print("╠" + "═"*58 + "╣")
         print(f"║  Total:   {n_total:<47}║")
-        print(f"║  Success: {n_success:<4} ✓{' '*42}║")
-        print(f"║  Failed:  {n_failed:<4} ✗{' '*42}║")
+        print(f"║  Success: {n_success:<4} OK{' '*41}║")
+        print(f"║  Failed:  {n_failed:<4} FAIL{' '*39}║")
         
         # 规划/控制统计
         print("╠" + "─"*58 + "╣")
         print("║  Planning & Control Statistics:" + " "*25 + "║")
         plan_rate = ps / (ps + pf) * 100 if (ps + pf) > 0 else 0
         ctrl_rate = cs / (cs + cf) * 100 if (cs + cf) > 0 else 0
-        print(f"║    Planning: {ps:>3} ✓ / {pf:>3} ✗  ({plan_rate:5.1f}% success){' '*12}║")
-        print(f"║    Control:  {cs:>3} ✓ / {cf:>3} ✗  ({ctrl_rate:5.1f}% success){' '*12}║")
+        print(f"║    Planning: {ps:>3} OK / {pf:>3} FAIL ({plan_rate:5.1f}% success){' '*10}║")
+        print(f"║    Control:  {cs:>3} OK / {cf:>3} FAIL ({ctrl_rate:5.1f}% success){' '*10}║")
         
         # 失败原因
         if failure_reasons:

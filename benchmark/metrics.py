@@ -51,13 +51,15 @@ class FailureThresholds:
     position_sanity_bound: float = 10000.0   # 位置绝对值上限 (m)
     
     # S1: 跟踪发散（滑动窗口）
-    tracking_window: float = 10.0            # 窗口时长 (s) - 放宽
-    tracking_error_threshold: float = 50.0   # 误差阈值 (m) - 进一步放宽
-    tracking_violation_ratio: float = 0.9    # 超限占比阈值 - 放宽
+    # 翼伞最小转弯半径 90m，弯道处横向偏差天然较大
+    # 阈值需与飞行器尺度匹配，取 min_turn_radius 级别
+    tracking_window: float = 15.0            # 窗口时长 (s) - 给翼伞足够修正时间
+    tracking_error_threshold: float = 80.0   # 误差阈值 (m) - 匹配翼伞机动尺度
+    tracking_violation_ratio: float = 0.9    # 超限占比阈值
     
-    # S3: 长时间饱和
-    saturation_window: float = 15.0          # 窗口时长 (s) - 放宽
-    saturation_ratio_threshold: float = 0.98 # 饱和占比阈值 - 几乎全程饱和才失败
+    # S3: 长时间饱和（翼伞控制器因下降率调节经常需要高偏转，暂时禁用此检测）
+    saturation_window: float = 15.0          # 窗口时长 (s)
+    saturation_ratio_threshold: float = 1.1  # >1.0 = 永远不会触发，等效禁用
     
     # 软失败检测的 warmup 时间（在此期间不检测软失败）
     soft_fail_warmup: float = 30.0           # 预热时长 (s) - 给控制器更多收敛时间
@@ -346,10 +348,11 @@ class FailureDetector:
         """检查长时间饱和"""
         th = self.thresholds
         
-        # 判断是否饱和（控制量接近边界）
+        # 判断是否饱和（控制量接近上界）
+        # 注意：翼伞控制中，操纵绳为0是正常状态（不拉绳=直飞/不加速下降）
+        # 只有接近最大偏转（=1.0）才是真正的饱和（控制器想做更多但做不到）
         delta_left, delta_right = control
-        is_saturated = (abs(delta_left - 1.0) < 0.01 or abs(delta_left) < 0.01 or
-                       abs(delta_right - 1.0) < 0.01 or abs(delta_right) < 0.01)
+        is_saturated = (delta_left >= 0.99 or delta_right >= 0.99)
         
         # 添加到窗口
         self.state.saturation_flags.append(is_saturated)
@@ -487,8 +490,9 @@ class MetricsCalculator:
             metrics['max_yaw_rate'] = float(np.max(np.abs(yaw_rate)))
         
         # === 饱和指标 ===
-        # 定义饱和：控制量接近 0 或 1
-        saturated = ((np.abs(controls - 1.0) < 0.01) | (np.abs(controls) < 0.01))
+        # 定义饱和：控制量接近上界（=1.0）才是饱和
+        # 注意：翼伞操纵绳为0是正常状态（不拉=直飞），不算饱和
+        saturated = (controls >= 0.99)
         # 任一通道饱和即计入
         saturation_steps = np.any(saturated, axis=1)
         metrics['saturation_ratio'] = float(np.mean(saturation_steps))

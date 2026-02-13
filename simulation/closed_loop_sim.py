@@ -190,18 +190,21 @@ class ClosedLoopSimulator:
         # descent_margin:    滑翔比余量系数，>1表示保守
         # ==========================================
         # 翼伞转弯是通过滚转实现的，响应较慢，需要保守的控制参数
+        min_turn_r = self.map_manager.constraints.min_turn_radius  # 从地图配置读取
         self.controller = ParafoilADRCController(
-            heading_kp=0.8,           # 保守：避免过度响应导致滚转失控
-            heading_kd=0.4,           # 适中：阻尼
-            heading_eso_omega=3.0,    # 低：减少噪声和过度补偿
-            heading_td_r=10.0,        # 低：平滑的参考过渡
-            lateral_kp=0.002,         # 低：避免横向误差过度修正
+            heading_kp=1.5,           # 提高响应：改善跟踪发散
+            heading_kd=0.6,           # 增加阻尼：抑制过冲
+            heading_eso_omega=6.0,    # 提高扰动估计带宽
+            heading_td_r=20.0,        # 加快参考跟踪
+            lateral_kp=0.006,         # 增大横向修正强度
+            lateral_kd=0.002,         # 新增D项：抑制来回摆动
             glide_ratio_natural=6.48, # 自然滑翔比 (无对称偏转)
             glide_ratio_min=2.47,     # 最小滑翔比 (最大对称偏转)
             descent_kp=0.5,           # 下降率控制增益
-            descent_margin=1.2,       # 滑翔比余量系数
+            descent_margin=1.15,      # 15%余量：偏向更陡下降，预防预算不足造成的高度延迟
             reference_speed=reference_speed,
-            lookahead_distance=100.0, # 大：更平滑的转弯
+            min_turn_radius=min_turn_r,  # 与规划器保持一致
+            lookahead_distance=80.0,  # Pure Pursuit前视距离：平衡路径跟踪与控制平滑
             max_deflection=1.0,       # 打满：允许使用全部滑翔比范围[2.47, 6.48]
             dt=control_dt
         )
@@ -310,6 +313,10 @@ class ClosedLoopSimulator:
             if 'path_length' in info:
                 print(f"    路径长度: {info['path_length']:.1f}m")
 
+        # 提取 edge_paths / node_chain（供 Dubins 感知后处理器使用）
+        edge_paths = info.get('edge_paths', None)
+        node_chain = info.get('node_chain', None)
+
         # 使用 TrajectoryPostprocessor 进行平滑处理
         if not self.quiet:
             print("[4/4] 轨迹后处理（平滑 + 时间参数化）...")
@@ -317,11 +324,18 @@ class ClosedLoopSimulator:
             reference_speed=self.reference_speed,
             control_frequency=1.0 / self.control_dt,
             min_turn_radius=self.map_manager.constraints.min_turn_radius,
+            max_glide_ratio=self.map_manager.constraints.glide_ratio,
+            min_glide_ratio=self.map_manager.constraints.min_glide_ratio,
+            map_manager=self.map_manager,
             quiet=self.quiet
         )
 
         end_heading = self.map_manager.target.approach_heading if self.map_manager.target else None
-        self.trajectory = postprocessor.process(path, smooth=smooth, end_heading=end_heading)
+        self.trajectory = postprocessor.process(
+            path, smooth=smooth, end_heading=end_heading,
+            edge_paths=edge_paths,
+            node_chain=node_chain
+        )
 
         if len(self.trajectory) == 0:
             if not self.quiet:
@@ -481,10 +495,10 @@ class ClosedLoopSimulator:
             avg_glide = total_dxy / max(total_dz, 0.01)
             print(f"    整体平均滑翔比: {avg_glide:.2f} (目标范围: {glide_min:.2f} ~ {glide_max:.2f})")
     
-    def init_state(self, 
+    def init_state(self,
                    position: np.ndarray = None,
                    heading: float = None,
-                   velocity: float = 10.0,
+                   velocity: float = None,
                    position_noise: np.ndarray = None,
                    heading_noise: float = 0.0,
                    use_rng: bool = True) -> np.ndarray:
@@ -530,7 +544,11 @@ class ClosedLoopSimulator:
         if position_noise is not None:
             position = position + np.array(position_noise)
         heading = heading + heading_noise
-        
+
+        # 默认使用参考速度，消除初始速度偏差
+        if velocity is None:
+            velocity = self.reference_speed
+
         # 构建20维状态向量
         # 翼伞典型滑翔状态: 前向速度约10-12m/s, 下沉速度约4-6m/s
         # 攻角约 5-10°, 俯仰角约 5-15°
@@ -541,7 +559,15 @@ class ClosedLoopSimulator:
         self.state[5] = heading                       # psi (航向角)
         self.state[8] = velocity                      # u (前向速度)
         self.state[9] = 0.0                           # v (侧向速度)
-        self.state[10] = 5.0                          # w (下沉速度，体坐标系，典型约5m/s)
+        # w (下沉速度, 体坐标系)
+        # 惯性下降率 v_D = -sin(θ)*u + cos(θ)*w  (NED 约定)
+        # 自然滑翔比 6.48, u=velocity → 惯性下降率 = u/GR
+        # u=8: 8/6.48=1.235 → w = (1.235+sin(8°)*8)/cos(8°) ≈ 2.37
+        # u=10: 10/6.48=1.54 → w ≈ 2.96
+        theta = np.radians(8)
+        descent_rate = velocity / 6.48  # 匹配自然滑翔比
+        w_init = (descent_rate + np.sin(theta) * velocity) / np.cos(theta)
+        self.state[10] = w_init                       # w (下沉速度，匹配自然滑翔比平衡态)
         
         return self.state.copy()
     
@@ -569,13 +595,17 @@ class ClosedLoopSimulator:
         while heading < -np.pi:
             heading += 2 * np.pi
         
-        # 体坐标系速度转惯性系
-        psi = heading
-        cos_psi, sin_psi = np.cos(psi), np.sin(psi)
-        vx = velocity_body[0] * cos_psi - velocity_body[1] * sin_psi
-        vy = velocity_body[0] * sin_psi + velocity_body[1] * cos_psi
-        vz = -velocity_body[2]  # 体坐标系 w 向下为正，惯性系 z 向上为正
-        velocity = np.array([vx, vy, vz])
+        # 体坐标系速度转惯性系 —— 使用完整 DCM（含 roll, pitch, yaw）
+        # 注意: 之前只用 yaw 做 2D 旋转，忽略了 pitch 分量
+        #   u*sin(theta) ≈ 10*sin(8°) ≈ 1.4 m/s 垂直分量被漏掉
+        #   导致传给控制器的下降率偏大，对称偏转控制失调
+        from models.parafoil_model import euler_to_dcm
+        phi, theta_e, psi_e = euler[0], euler[1], heading
+        R_nb = euler_to_dcm(phi, theta_e, psi_e)   # 惯性→体
+        v_body_col = velocity_body.reshape(3, 1)
+        v_inertial = R_nb.T @ v_body_col            # 体→惯性
+        v_inertial[2, 0] = -v_inertial[2, 0]        # NED→NEU (z 向上为正)
+        velocity = v_inertial.flatten()
         
         # 2. 控制器更新（使用归一化后的航向角）
         ctrl = self.controller.update(
@@ -827,6 +857,13 @@ class ClosedLoopSimulator:
                 break
         
         elapsed = time.time() - start_time
+        
+        # 如果循环结束但没有明确的终止原因，标记为超时
+        if termination_reason is None and t >= max_time:
+            termination_reason = TerminationReason.S4_TIMEOUT
+            if enable_failure_detection and hasattr(self, 'failure_detector'):
+                self.failure_detector._trigger_failure(TerminationReason.S4_TIMEOUT, t)
+                self.failure_detector.detection_results['S4_timeout'] = True
         
         # 存储终止信息
         self._last_termination_reason = termination_reason
