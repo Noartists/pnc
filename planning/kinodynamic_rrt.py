@@ -532,7 +532,9 @@ class KinodynamicRRTStar:
                 path_2d = [np.array([from_s.x, from_s.y]), np.array([target_x, target_y])]
                 path_len = np.sqrt((target_x - from_s.x)**2 + (target_y - from_s.y)**2)
             else:
-                path_2d = self.dubins.sample(dubins_path, num_points=15)
+                # [调参] 按弧长自适应采样，间距约20m，避免长/短弧密度差异导致曲率噪声
+                n_pts = int(np.clip(dubins_path['length'] / 20.0, 4, 80))
+                path_2d = self.dubins.sample(dubins_path, num_points=n_pts)
                 path_len = dubins_path['length']
 
                 if len(path_2d) < 2:

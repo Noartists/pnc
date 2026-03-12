@@ -192,19 +192,20 @@ class ClosedLoopSimulator:
         # 翼伞转弯是通过滚转实现的，响应较慢，需要保守的控制参数
         min_turn_r = self.map_manager.constraints.min_turn_radius  # 从地图配置读取
         self.controller = ParafoilADRCController(
-            heading_kp=1.5,           # 提高响应：改善跟踪发散
-            heading_kd=0.6,           # 增加阻尼：抑制过冲
-            heading_eso_omega=6.0,    # 提高扰动估计带宽
+            heading_kp=6.0,           # [调参] 提高响应增益：原1.5→6.0
+            heading_kd=2.0,           # [调参] 提高阻尼：原0.6→2.0
+            heading_eso_omega=40.0,   # [调参] 提高ESO带宽：原6.0→40.0
             heading_td_r=20.0,        # 加快参考跟踪
-            lateral_kp=0.006,         # 增大横向修正强度
-            lateral_kd=0.002,         # 新增D项：抑制来回摆动
+            heading_b0=0.5,           # [调参] 修正控制效能估计：原3.0→0.5，kp/b0从0.5提升到12
+            lateral_kp=0.01,          # [调参] 提高横向修正强度：原0.006→0.01
+            lateral_kd=0.003,         # 抑制来回摆动
             glide_ratio_natural=6.48, # 自然滑翔比 (无对称偏转)
             glide_ratio_min=2.47,     # 最小滑翔比 (最大对称偏转)
             descent_kp=0.5,           # 下降率控制增益
             descent_margin=1.15,      # 15%余量：偏向更陡下降，预防预算不足造成的高度延迟
             reference_speed=reference_speed,
             min_turn_radius=min_turn_r,  # 与规划器保持一致
-            lookahead_distance=80.0,  # Pure Pursuit前视距离：平衡路径跟踪与控制平滑
+            lookahead_distance=100.0, # [调参] 增大前视距离：翼伞响应慢，需要更长预见时间
             max_deflection=1.0,       # 打满：允许使用全部滑翔比范围[2.47, 6.48]
             dt=control_dt
         )

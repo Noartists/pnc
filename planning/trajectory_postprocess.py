@@ -277,7 +277,9 @@ class TrajectoryPostprocessor:
             end_pose = (result[j + 1][0], result[j + 1][1], heading_in)
             dubins_path = self.dubins.compute(start_pose, end_pose)
             if dubins_path is not None:
-                transition_pts = self.dubins.sample(dubins_path, num_points=10)
+                # [调参] 按弧长自适应采样，间距约15m
+                n_pts = int(np.clip(dubins_path['length'] / 15.0, 4, 30))
+                transition_pts = self.dubins.sample(dubins_path, num_points=n_pts)
                 if len(transition_pts) > 2:
                     # 替换接缝点: 移除 j 和 j+1，插入过渡弧
                     new_pts = [np.array([pt[0], pt[1]]) for pt in transition_pts]

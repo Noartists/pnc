@@ -133,7 +133,7 @@ corridor:
 
 # ---------- 约束参数 ----------
 constraints:
-  min_turn_radius: 90
+  min_turn_radius: 120    # [调参] 物理极限~109m(v=8m/s,ω_max=0.0736rad/s)，原90m超出物理极限21%
   max_bank_angle: 30
   min_altitude: 20           # 最低飞行高度
   terminal_altitude: 50      # 进场高度

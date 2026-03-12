@@ -520,6 +520,7 @@ class ParafoilADRCController:
                  heading_kd: float = 0.5,
                  heading_eso_omega: float = 20.0,
                  heading_td_r: float = 30.0,
+                 heading_b0: float = 0.5,
                  # 横向误差控制参数
                  lateral_kp: float = 0.01,
                  lateral_kd: float = 0.005,
@@ -541,6 +542,7 @@ class ParafoilADRCController:
             heading_kd: 航向微分增益 (增加可抑制震荡)
             heading_eso_omega: ESO带宽 (越大扰动估计越快，太大噪声敏感)
             heading_td_r: TD快速因子 (越小参考信号过渡越平滑)
+            heading_b0: 控制效能估计值 (翼伞实际偏航加速度灵敏度，过大→控制效能不足)
             lateral_kp: 横向误差增益 (越大路径跟踪越紧)
             lateral_kd: 横向误差微分增益
             glide_ratio_natural: 自然滑翔比，无对称偏转时的L/D
@@ -566,17 +568,9 @@ class ParafoilADRCController:
         self.descent_margin = descent_margin
         
         # 航向ADRC控制器
-        # b0: 控制增益估计值，需要根据系统特性调整
-        # 翼伞通过滚转转弯，航向响应较慢，b0应该较大以避免过度控制
-        # b0: 控制增益估计值
-        # 翼伞最大偏航率仅 ~6.5°/s，航向响应带宽极低
-        # b0 过小→有效增益过大→控制器慢性饱和→挤占下降通道
-        # b0=1.5 时：kp/b0=1.0，57° 误差即饱和（saturation >88%）
-        # b0=3.5 时：kp/b0=0.43，太保守，偏航响应不足
-        # b0=3.0 时：kp/b0=0.5，115° 误差才饱和 → 更少控制预算占用
-        # 给对称偏转(下降控制)留出更多余量
-        b0_heading = 3.0
-
+        # b0: 控制效能估计值，对应翼伞实际偏航角加速度对操纵绳偏转的灵敏度
+        # 翼伞最大偏航率仅 ~6.5°/s，Cnda=-0.02（小），Cnr=-0.14（强阻尼）
+        # 实际 b0 ≈ 0.3~0.8，过大会导致有效控制增益 kp/b0 不足，跟踪迟缓
         self.heading_adrc = ADRC(
             td_r=heading_td_r,    # TD快速因子：越小过渡越平滑
             td_h=dt,
@@ -586,7 +580,7 @@ class ParafoilADRCController:
             kp=heading_kp,
             kd=heading_kd,
             use_linear_sef=True,  # 线性SEF，响应更直接
-            b0=b0_heading,
+            b0=heading_b0,
             u_min=-max_deflection,
             u_max=max_deflection
         )
@@ -761,14 +755,15 @@ class ParafoilADRCController:
             return None
 
         # 自适应前视距离：基于最近点的曲率
-        # 翼伞是慢响应系统（最大偏航率 ~6.5°/s），弯道时需要更长前视
-        # 以便提前感知转弯方向，给控制器充足反应时间
+        # Pure Pursuit 理论：弯道时应缩短前视距离以减少切弯误差
+        # 稳态横向误差 ≈ L_a² / (2R)，缩短 L_a 可显著降低弯道误差
+        # 直线段可适当增大前视距离以保持平滑
         curvature = self.trajectory[closest_idx].curvature
         if curvature > 0.001:
-            # 弯道：增加前视距离，最大 2 倍标称值
-            scale = 1.0 + min(curvature * self.min_turn_radius, 1.0)
-            effective_la = min(self.lookahead_distance * scale,
-                              self.lookahead_distance * 2.0)
+            # 弯道：缩短前视距离，防止 Pure Pursuit 切弯
+            # scale 在 [0.4, 1.0]，曲率越大（弯越紧）前视越短
+            scale = max(0.4, 1.0 - min(curvature * self.min_turn_radius, 0.6))
+            effective_la = self.lookahead_distance * scale
         else:
             effective_la = self.lookahead_distance
 
@@ -971,19 +966,20 @@ class ParafoilADRCController:
 
         # ====== 进度自适应对称/非对称偏转预算分配 ======
         # 根据飞行进度动态调整对称偏转(下降控制)的最低预算：
-        #   前半程 (<0.5): 20% → 允许足够航向修正
-        #   中段 (0.5~0.8): 30% → 平衡航向与下降
-        #   末段 (>0.8): 50% → 高度收敛优先
-        #   末端下降 (>0.95): 70% → 全力下降收敛
+        #   前半程 (<0.5): 10% → 优先航向修正，下降有规划保障
+        #   中段 (0.5~0.8): 20% → 适度平衡，航向仍是主要任务
+        #   末段 (>0.8): 35% → 高度收敛逐渐优先
+        #   末端下降 (>0.95): 55% → 全力下降收敛
+        # [调参] 整体下调预算比例，给航向控制释放更多操纵余量
         progress = self.get_progress()
         if progress > 0.95:
-            budget_ratio = 0.70
+            budget_ratio = 0.55
         elif progress > 0.8:
-            budget_ratio = 0.50
+            budget_ratio = 0.35
         elif progress > 0.5:
-            budget_ratio = 0.30
-        else:
             budget_ratio = 0.20
+        else:
+            budget_ratio = 0.10
         min_symmetric_budget = budget_ratio * self.max_deflection
         max_asymmetric = self.max_deflection - min_symmetric_budget
         delta_a_abs = min(delta_a_abs, max_asymmetric)      # 限制非对称上限
