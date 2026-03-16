@@ -133,7 +133,7 @@ corridor:
 
 # ---------- 约束参数 ----------
 constraints:
-  min_turn_radius: 50
+  min_turn_radius: 120    # [调参] 物理极限~109m(v=8m/s,ω_max=0.0736rad/s)，原90m超出物理极限21%
   max_bank_angle: 30
   min_altitude: 20           # 最低飞行高度
   terminal_altitude: 50      # 进场高度
@@ -144,7 +144,7 @@ constraints:
 
 # ---------- 轨迹参数 ----------
 trajectory:
-  reference_speed: 9.0    # 参考飞行速度 (m/s)，取10-15范围中值
+  reference_speed: 8.0    # 参考飞行速度 (m/s)，接近实测水平速度7.6m/s
   control_frequency: 100   # 控制频率 (Hz)
   sample_dt: 0.01          # 采样周期 (s) = 1/freq
 
@@ -152,7 +152,7 @@ trajectory:
 # 启用后会覆盖上面手动定义的禁飞区，并随机化起点终点
 randomization:
   enabled: true           # 是否启用随机化 (true/false)
-  seed: 42                # 随机种子 (null=每次不同, 固定数字=可复现)
+  seed: null                # 随机种子 (null=每次不同, 固定数字=可复现)
   randomize_endpoints: true  # 是否随机化起点终点
   n_obstacles: 20         # 障碍物数量
   radius_range: [40, 100]   # 半径范围 (m)
