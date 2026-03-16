@@ -3,6 +3,10 @@ trajectory_dataset/
 visualization/data/
 benchmark/outputs/
 paper/
+learning/datasets/
+learning/checkpoints/
+learning/figures/
+learning/mpc_results/
 
 # ==================== Python ====================
 __pycache__/
