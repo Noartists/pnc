@@ -19,7 +19,7 @@ import numpy as np
 import h5py
 from dataclasses import dataclass, field, asdict
 from typing import Tuple, Optional, List, Dict
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, freeze_support
 from functools import partial
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -303,7 +303,16 @@ class DatasetGenerator:
         """
         cfg = self.cfg
         n = cfg.n_trajectories
-        n_workers = cfg.n_workers or max(1, cpu_count() - 1)
+
+        # On Windows, force single-process to avoid spawn-related hangs.
+        # Use --n-workers 1 or rely on this default.
+        if sys.platform == "win32" and cfg.n_workers != 1:
+            n_workers = 1
+            print("Note: Windows detected, using single-process mode "
+                  "(multiprocessing.Pool can hang on Windows with spawn).")
+            print("  For parallel generation, consider running on Linux or WSL.")
+        else:
+            n_workers = cfg.n_workers or max(1, cpu_count() - 1)
 
         # Reproducible seeds
         ss = np.random.SeedSequence(base_seed)
@@ -328,22 +337,24 @@ class DatasetGenerator:
             for i, args in enumerate(args_list):
                 r = _worker(args)
                 results.append(r)
-                if (i + 1) % 100 == 0 or i == n - 1:
+                if (i + 1) % max(1, n // 10) == 0 or i == n - 1:
                     elapsed = time.time() - t0
                     rate = (i + 1) / elapsed
+                    eta = (n - i - 1) / rate if rate > 0 else 0
                     print(f"  [{i+1}/{n}] {rate:.1f} traj/s, "
-                          f"elapsed={elapsed:.1f}s")
+                          f"elapsed={elapsed:.1f}s, ETA={eta:.0f}s")
         else:
             results = []
             with Pool(n_workers) as pool:
                 for i, r in enumerate(pool.imap_unordered(_worker, args_list,
                                                           chunksize=10)):
                     results.append(r)
-                    if (i + 1) % 100 == 0 or i == n - 1:
+                    if (i + 1) % max(1, n // 10) == 0 or i == n - 1:
                         elapsed = time.time() - t0
                         rate = (i + 1) / elapsed
+                        eta = (n - i - 1) / rate if rate > 0 else 0
                         print(f"  [{i+1}/{n}] {rate:.1f} traj/s, "
-                              f"elapsed={elapsed:.1f}s")
+                              f"elapsed={elapsed:.1f}s, ETA={eta:.0f}s")
 
         elapsed = time.time() - t0
         print(f"\nGeneration done in {elapsed:.1f}s")
@@ -491,4 +502,5 @@ def main():
 
 
 if __name__ == "__main__":
+    freeze_support()
     main()

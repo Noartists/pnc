@@ -7,6 +7,7 @@ Features:
   - Curriculum learning on prediction horizon
   - Periodic autoregressive validation
   - Checkpoint saving / resumption
+  - TensorBoard logging (optional)
   - wandb logging (optional)
 """
 
@@ -86,6 +87,8 @@ class TrainConfig:
     resume_from: Optional[str] = None
 
     # Logging
+    use_tensorboard: bool = False
+    tensorboard_log_dir: str = "learning/runs"
     use_wandb: bool = False
     wandb_project: str = "parafoil-dynamics"
     wandb_run_name: Optional[str] = None
@@ -250,6 +253,18 @@ class Trainer:
         if config.resume_from:
             self._load_checkpoint(config.resume_from)
 
+        # TensorBoard
+        self.tb_writer = None
+        if config.use_tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                log_dir = os.path.join(ROOT_DIR, config.tensorboard_log_dir)
+                self.tb_writer = SummaryWriter(log_dir=log_dir)
+                print(f"TensorBoard 日志目录: {log_dir}")
+                print(f"  运行: tensorboard --logdir={log_dir}")
+            except ImportError:
+                print("tensorboard 未安装，跳过。运行: pip install tensorboard")
+
         # wandb
         self.wandb_run = None
         if config.use_wandb:
@@ -308,6 +323,13 @@ class Trainer:
             if val_loss is not None:
                 msg += f" | val_loss={val_loss:.6f}"
             print(msg)
+
+            if self.tb_writer:
+                self.tb_writer.add_scalar("train/loss", train_loss, self.global_step)
+                self.tb_writer.add_scalar("train/lr", lr, self.global_step)
+                self.tb_writer.add_scalar("train/active_H", active_H, self.global_step)
+                if val_loss is not None:
+                    self.tb_writer.add_scalar("val/loss", val_loss, self.global_step)
 
             if self.wandb_run:
                 log = {"train/loss": train_loss, "train/lr": lr,

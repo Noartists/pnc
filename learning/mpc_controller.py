@@ -435,8 +435,9 @@ def run_mpc_benchmark(
         real_plant = ODEDynamicsRollout(real_para, dt=0.01)
 
         # --- Learned MPPI ---
+        model_horizon = train_cfg.get("prediction_horizon", 20)
         mppi_cfg = MPPIConfig(
-            n_samples=128, prediction_horizon=20,
+            n_samples=128, prediction_horizon=model_horizon,
             context_length=train_cfg.get("context_length", 50),
         )
         learned_dynamics = LearnedDynamicsRollout(model, norm, device)

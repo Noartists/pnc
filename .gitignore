@@ -6,6 +6,7 @@ paper/
 learning/datasets/
 learning/checkpoints/
 learning/figures/
+learning/eval_results/
 learning/mpc_results/
 
 # ==================== Python ====================
@@ -49,6 +50,9 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# ==================== wandb ====================
+wandb/
+
 # ==================== 日志和临时文件 ====================
 *.log
 *.tmp
@@ -57,9 +61,15 @@ Thumbs.db
 # ==================== Jupyter Notebook ====================
 .ipynb_checkpoints/
 
+# ==================== TensorBoard ====================
+runs/
+learning/checkpoints/runs/
+
 # ==================== 模型和数据文件 ====================
 *.pkl
 *.h5
 *.pt
 *.pth
 *.onnx
+*.npz
+*.npy

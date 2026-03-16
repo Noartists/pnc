@@ -389,6 +389,21 @@ def plot_all_figures(
 #                    CLI entry point
 # ============================================================
 
+def _make_eval_run_dir(base_dir: str, checkpoint_path: str) -> str:
+    """
+    Create a unique evaluation output directory:
+      learning/eval_results/<date>_<checkpoint_name>/
+    e.g. learning/eval_results/20260317_035200_best/
+    """
+    from datetime import datetime
+
+    ckpt_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(ROOT_DIR, base_dir, f"{timestamp}_{ckpt_name}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
 def main():
     import argparse
 
@@ -402,15 +417,20 @@ def main():
     parser.add_argument("--K-values", type=int, nargs='+',
                         default=[5, 10, 20, 30, 50])
     parser.add_argument("--max-trajs", type=int, default=50)
-    parser.add_argument("--output-dir", type=str, default="learning/figures")
+    parser.add_argument("--output-base-dir", type=str, default="learning/eval_results",
+                        help="Base directory for eval outputs (each run gets a subfolder)")
 
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Create unique output directory for this eval run
+    run_dir = _make_eval_run_dir(args.output_base_dir, args.checkpoint)
+    print(f"Eval output directory: {run_dir}")
+
     # Load checkpoint
     print(f"Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     train_cfg = ckpt.get("config", {})
 
     model_cfg = ModelConfig(
@@ -429,6 +449,23 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print(f"Model loaded: {model.count_parameters():,} params")
+
+    # Save run metadata
+    run_meta = {
+        "checkpoint": os.path.abspath(args.checkpoint),
+        "model_params": model.count_parameters(),
+        "d_model": train_cfg.get("d_model"),
+        "n_layers": train_cfg.get("n_layers"),
+        "n_heads": train_cfg.get("n_heads"),
+        "context_length": train_cfg.get("context_length"),
+        "prediction_horizon": train_cfg.get("prediction_horizon"),
+        "train_epoch": ckpt.get("epoch"),
+        "train_best_val_loss": ckpt.get("best_val_loss"),
+        "K_values": args.K_values,
+        "max_trajs": args.max_trajs,
+    }
+    with open(os.path.join(run_dir, "run_info.json"), 'w') as f:
+        json.dump(run_meta, f, indent=2)
 
     # Load normalization stats
     norm_path = train_cfg.get("norm_stats_path", "learning/datasets/pilot_norm.npz")
@@ -479,8 +516,7 @@ def main():
                   f"MAE={result.mae_total:.6f} (n={result.n_samples})")
 
     # Save metrics JSON
-    metrics_path = os.path.join(args.output_dir, "eval_metrics.json")
-    os.makedirs(args.output_dir, exist_ok=True)
+    metrics_path = os.path.join(run_dir, "eval_metrics.json")
     metrics_json = {}
     for sn, kr in all_results.items():
         metrics_json[sn] = {}
@@ -495,11 +531,13 @@ def main():
         json.dump(metrics_json, f, indent=2)
     print(f"\nMetrics saved to {metrics_path}")
 
-    # Generate figures
+    # Generate figures into the run directory
     try:
-        plot_all_figures(all_results, args.output_dir, H)
+        plot_all_figures(all_results, run_dir, H)
     except ImportError:
         print("matplotlib not available, skipping figure generation")
+
+    print(f"\nAll results saved to: {run_dir}")
 
 
 if __name__ == "__main__":

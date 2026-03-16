@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-翼伞无人机路径规划与控制项目，包含动力学建模、Kinodynamic RRT* 路径规划、轨迹平滑、ADRC 控制器、闭环仿真、Benchmark 测试框架和 Web 可视化模块。
+翼伞无人机路径规划与控制项目，包含 8-DOF 动力学建模、Kinodynamic RRT* 路径规划、轨迹平滑、ADRC 控制器、闭环仿真、Benchmark 测试框架、Web 可视化，以及基于 Transformer 的 **In-Context Dynamics Model** 学习模块。
 
 > **维护者**: 张驰  
 > **联系方式**: zhangchi9900@gmail.com  
@@ -14,6 +14,7 @@
 
 - [项目结构](#项目结构)
 - [快速开始](#快速开始)
+- [In-Context Dynamics Model](#in-context-dynamics-model)
 - [Benchmark 测试框架](#benchmark-测试框架)
 - [Web 可视化](#web-可视化)
 - [命令行参数速查](#命令行参数速查)
@@ -31,7 +32,7 @@ pnc/
 │   └── map_config.yaml            # 地图与任务配置（支持场景随机化）
 │
 ├── models/                        # 动力学模型
-│   └── parafoil_model.py          # 8自由度翼伞模型
+│   └── parafoil_model.py          # 8自由度翼伞模型（20维状态向量）
 │
 ├── planning/                      # 规划模块
 │   ├── map_manager.py             # 地图管理器（障碍物、约束、可达性分析）
@@ -50,9 +51,25 @@ pnc/
 │   ├── runner.py                  # Benchmark 运行器（批量测试）
 │   ├── metrics.py                 # 失败检测与质量指标计算
 │   ├── outputs.py                 # 结果导出（metrics.json, case.json）
-│   ├── rng_manager.py             # 随机数管理（可复现性）
-│   └── outputs/                   # 测试结果输出目录
-│       └── exp_YYYYMMDD_HHMMSS/   # 每次实验的结果
+│   └── rng_manager.py             # 随机数管理（可复现性）
+│
+├── learning/                      # ★ In-Context Dynamics Learning
+│   ├── configs/                   # 训练配置
+│   │   ├── test.yaml              #   流水线验证（200条, d=64, 10 epochs）
+│   │   ├── pilot.yaml             #   小规模实验（1000条, d=128, 50 epochs）
+│   │   └── full.yaml              #   正式训练（50000条, d=256, 200 epochs）
+│   ├── data_generation/           # 数据生成
+│   │   ├── dataset_generator.py   #   轨迹生成器（HDF5 输出）
+│   │   ├── domain_randomization.py#   域随机化（参数/风场/执行器/噪声）
+│   │   └── control_policies.py    #   控制策略（随机/激励/闭环+噪声）
+│   ├── dataset.py                 # PyTorch Dataset + 归一化 + 状态编码
+│   ├── model.py                   # Transformer 架构 + MLP 基线
+│   ├── trainer.py                 # 训练循环（课程学习/wandb/TensorBoard）
+│   ├── train.py                   # 训练 CLI 入口
+│   ├── evaluate.py                # 评测框架（IID/OOD/消融/图表）
+│   ├── mpc_controller.py          # MPPI 闭环控制器
+│   ├── visualize_dataset.py       # 数据集可视化
+│   └── requirements.txt           # 依赖列表
 │
 └── visualization/                 # Web 可视化模块
     ├── server.py                  # Flask 服务器
@@ -83,7 +100,21 @@ python simulation/closed_loop_sim.py --seed=42
 python simulation/closed_loop_sim.py --output-dir=results/
 ```
 
-### 3. 运行 Benchmark 批量测试
+### 3. 训练 In-Context Dynamics Model（详见 [专节](#in-context-dynamics-model)）
+
+```bash
+# 安装额外依赖
+pip install -r learning/requirements.txt
+
+# 快速验证流水线
+python -m learning.data_generation.dataset_generator --n-trajs 200 --n-steps 500 --output learning/datasets/test.h5 --dataset-name test
+python -m learning.train --config learning/configs/test.yaml
+
+# 评测
+python -m learning.evaluate --checkpoint learning/checkpoints/best.pt --generate-eval-data --K-values 5 10 20 30
+```
+
+### 4. 运行 Benchmark 批量测试
 
 ```bash
 # 运行 10 个随机种子
@@ -96,7 +127,7 @@ python -m benchmark.runner --seeds 1-50
 python -m benchmark.runner --seeds 100 --resume
 ```
 
-### 4. 启动 Web 可视化
+### 5. 启动 Web 可视化
 
 ```bash
 # 启动服务器
@@ -105,6 +136,116 @@ python visualization/server.py --port=8080
 # 浏览器访问
 # http://127.0.0.1:8080
 ```
+
+---
+
+## In-Context Dynamics Model
+
+基于 Transformer 的翼伞动力学基础模型，核心思想：通过观察短历史序列（状态-动作对），让模型在测试时**自适应**未知的物理参数、风场等操作条件，无需重新训练。
+
+### 核心思路
+
+传统物理模型（`models/parafoil_model.py`）的参数在实际飞行中不精确（磨损、载荷变化、未知风场等）。本模块训练一个序列模型来**隐式辨识**这些未知因素：
+
+```
+输入:  最近 K 步 [(state_t, action_t), ..., (state_{t+K}, action_{t+K})]
+输出:  未来 H 步的状态变化量 [Δstate_{t+K+1}, ..., Δstate_{t+K+H}]
+```
+
+训练时通过**域随机化**（Domain Randomization）生成大量不同条件下的轨迹，模型从中学会：给定一段历史，推断当前条件并做出准确预测。
+
+### 完整流水线
+
+```
+Step 1: 数据生成 ──→ Step 2: 训练 ──→ Step 3: 评测 ──→ Step 4: MPC闭环
+```
+
+#### Step 1: 生成训练数据
+
+```bash
+# 生成 5000 条轨迹，每条 2000 步，保存为 HDF5
+python -m learning.data_generation.dataset_generator \
+    --n-trajs 5000 \
+    --n-steps 2000 \
+    --output learning/datasets/pilot.h5 \
+    --dataset-name pilot
+```
+
+每条轨迹会随机化：
+- **物理参数**：质量、翼面积、气动系数等（±10%~30%）
+- **风场**：AR(1) 随机风，风速 0~5 m/s，随机方向和湍流
+- **执行器**：一阶滞后 + 随机延迟
+- **传感器噪声**：位置/速度/姿态加性高斯噪声
+- **控制策略**：随机分段常值、频率扫描激励、带噪声的 ADRC 闭环
+
+#### Step 2: 训练模型
+
+```bash
+# 使用配置文件训练（推荐）
+python -m learning.train --config learning/configs/pilot.yaml --tensorboard
+
+# TensorBoard 实时监控
+tensorboard --logdir learning/checkpoints/runs/
+```
+
+三档配置：
+
+| 配置 | 数据量 | 模型大小 | 训练轮次 | 用途 |
+|------|--------|---------|---------|------|
+| `test.yaml` | 200 条 | d=64, L=2 | 10 | 流水线验证 |
+| `pilot.yaml` | 1000 条 | d=128, L=4 | 50 | 小规模实验 |
+| `full.yaml` | 50000 条 | d=256, L=6 | 200 | 正式训练 |
+
+训练自动保存到 `learning/checkpoints/`：`best.pt`（验证集最优）、`epoch_XXXX.pt`（周期保存）、`final.pt`。
+
+#### Step 3: 评测
+
+```bash
+python -m learning.evaluate \
+    --checkpoint learning/checkpoints/best.pt \
+    --generate-eval-data \
+    --K-values 5 10 20 30 50 \
+    --max-trajs 50
+```
+
+自动生成三类评测数据并出图：
+
+| 评测集 | 说明 | 目的 |
+|--------|------|------|
+| **IID** | 同分布：参数/风场范围与训练相同 | 验证基本拟合能力 |
+| **OOD-Param** | 分布外参数：扰动范围扩大到 1.8 倍 | 验证对未知物理参数的适应 |
+| **OOD-Wind** | 分布外风场：风速 5~10 m/s（训练仅 0~5） | 验证对未知环境的适应 |
+
+输出保存到 `learning/eval_results/<timestamp>_<checkpoint>/`，包含：
+- `run_info.json` — 模型配置与运行元信息
+- `eval_metrics.json` — 量化指标（RMSE / MAE / 逐通道误差）
+- `fig1_context_adaptation.png` — RMSE vs Context Length K（in-context 适应曲线）
+- `fig2_horizon_error.png` — 误差随预测步长的增长
+- `fig3_channel_heatmap.png` — 各状态通道 RMSE 热力图
+
+#### Step 4: MPC 闭环验证
+
+```bash
+python -m learning.mpc_controller \
+    --checkpoint learning/checkpoints/best.pt \
+    --norm-stats learning/datasets/pilot_norm.npz \
+    --n-trials 20
+```
+
+使用 MPPI（Model Predictive Path Integral）控制器，将学到的 Transformer 动力学模型作为内部预测器，在扰动 ODE 环境中闭环控制翼伞飞行。
+
+### 模型架构
+
+```
+Input MLP ──→ Transformer Encoder (L layers) ──→ Cross-Attention ──→ Output Heads
+  ↑                    ↑                              ↑                    ↓
+(K, token_dim)   Learnable PosEmb                Query: horizon      (H, target_dim)
+                                                  embeddings         状态变化量 Δstate
+```
+
+- **输入**：K 步历史 token（归一化状态 + 动作，sin/cos 角度编码），维度 = 22
+- **输出**：H 步未来状态变化量（17 维 delta：角速率、速度、角速度变化）
+- **训练目标**：多步 delta 预测，Huber loss + 时间衰减权重 + 课程学习
 
 ---
 
@@ -198,6 +339,43 @@ python visualization/server.py --port=8080 --host=127.0.0.1
 
 ## 命令行参数速查
 
+### `python -m learning.data_generation.dataset_generator` - 数据生成
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--n-trajs` | `1000` | 轨迹数量 |
+| `--n-steps` | `2000` | 每条轨迹仿真步数 |
+| `--output` | `learning/datasets/data.h5` | 输出 HDF5 路径 |
+| `--dataset-name` | `data` | 数据集名称（用于归一化文件命名） |
+| `--n-workers` | `1` | 并行进程数（Windows 下强制为 1） |
+
+### `python -m learning.train` - 模型训练
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--config` | *必选* | YAML 配置文件路径 |
+| `--tensorboard` | `false` | 启用 TensorBoard 日志 |
+
+### `python -m learning.evaluate` - 模型评测
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--checkpoint` | *必选* | 模型 checkpoint 路径 |
+| `--eval-data-dir` | `learning/datasets` | 评测数据目录 |
+| `--generate-eval-data` | `false` | 是否先生成评测数据 |
+| `--K-values` | `5 10 20 30 50` | Context length 消融值 |
+| `--max-trajs` | `50` | 每个 split 最多使用的轨迹数 |
+| `--output-base-dir` | `learning/eval_results` | 输出根目录 |
+
+### `python -m learning.mpc_controller` - MPC 闭环验证
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--checkpoint` | *必选* | 模型 checkpoint 路径 |
+| `--norm-stats` | *必选* | 归一化统计文件路径 (`.npz`) |
+| `--n-trials` | `20` | 闭环仿真试次数 |
+| `--output-dir` | `learning/mpc_results` | 输出目录 |
+
 ### `python -m benchmark.runner` - Benchmark 运行器
 
 | 参数 | 默认值 | 说明 |
@@ -274,7 +452,40 @@ python visualization/server.py --port=8080 --host=127.0.0.1
 - `delta_left`：左操纵绳偏转 [0, 1]
 - `delta_right`：右操纵绳偏转 [0, 1]
 
-### 3. 仿真模块 (`simulation/`)
+### 3. 学习模块 (`learning/`)
+
+#### 数据生成 (`data_generation/`)
+
+- `domain_randomization.py` — 物理参数扰动规格（`PARAM_PERTURBATION_SPEC`）、风场模型（`WindField`，支持恒定/AR(1)模式）、执行器滞后（`ActuatorModel`）、传感器噪声（`SensorNoiseModel`）
+- `control_policies.py` — 随机分段常值、频率扫描激励信号（chirp/step/doublet）、带噪声 ADRC 闭环
+- `dataset_generator.py` — 主生成器，集成以上模块，运行 ODE 仿真并输出 HDF5
+
+#### 模型 (`model.py`)
+
+- `InContextDynamicsTransformer` — Transformer Encoder + Cross-Attention + Per-Horizon Output Heads
+- `MLPDynamicsModel` — 简单 MLP 基线
+
+#### 训练 (`trainer.py`)
+
+- `MultiStepLoss` — 多步预测损失（Huber + 时间衰减 + 通道权重）
+- 课程学习（逐步增加预测步长 H）
+- Warmup + CosineAnnealing 学习率调度
+- 支持 wandb 和 TensorBoard 日志
+
+#### 评测 (`evaluate.py`)
+
+- 三类评测集生成（IID / OOD-Param / OOD-Wind）
+- Context length 消融实验
+- 自回归 rollout + 逐通道误差分析
+- 自动生成 publication-quality 图表
+
+#### MPC 控制 (`mpc_controller.py`)
+
+- MPPI 采样优化控制器
+- 支持 Learned Dynamics / ODE Dynamics 两种 rollout 后端
+- 闭环仿真（控制器规划 + 扰动 ODE 环境执行）
+
+### 4. 仿真模块 (`simulation/`)
 
 #### `closed_loop_sim.py` - 闭环仿真器
 
@@ -289,7 +500,7 @@ python visualization/server.py --port=8080 --host=127.0.0.1
 输出: 可视化 / 数据导出
 ```
 
-### 4. Benchmark 模块 (`benchmark/`)
+### 5. Benchmark 模块 (`benchmark/`)
 
 #### `runner.py` - Benchmark 运行器
 
@@ -394,18 +605,18 @@ results = runner.run_all()
 
 ## 依赖
 
-```
-numpy
-scipy
-matplotlib
-pyyaml
-flask
-tqdm
-```
+**基础模块**（规划/控制/仿真/可视化）:
 
-安装全部依赖:
 ```bash
 pip install numpy scipy matplotlib pyyaml flask tqdm
+```
+
+**学习模块**（额外依赖）:
+
+```bash
+pip install -r learning/requirements.txt
+# 核心: torch>=2.0, h5py>=3.8, pyyaml, numpy, scipy, matplotlib
+# 可选: wandb (实验跟踪)
 ```
 
 ---

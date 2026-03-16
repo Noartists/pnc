@@ -56,6 +56,8 @@ def load_config_from_yaml(yaml_path: str, overrides: dict) -> TrainConfig:
     # CLI overrides
     if overrides.get("resume"):
         tc.resume_from = overrides["resume"]
+    if overrides.get("tensorboard"):
+        tc.use_tensorboard = True
     if overrides.get("wandb"):
         tc.use_wandb = True
     if overrides.get("run_name"):
@@ -72,6 +74,8 @@ def main():
                         help="Path to YAML config file")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
+    parser.add_argument("--tensorboard", action="store_true",
+                        help="Enable TensorBoard logging")
     parser.add_argument("--wandb", action="store_true",
                         help="Enable wandb logging")
     parser.add_argument("--run-name", type=str, default=None)
@@ -81,6 +85,7 @@ def main():
 
     overrides = {
         "resume": args.resume,
+        "tensorboard": args.tensorboard,
         "wandb": args.wandb,
         "run_name": args.run_name,
         "epochs": args.epochs,

@@ -7,8 +7,20 @@ Three types:
   3. Open-loop excitation signals (chirp, step, doublet)
 """
 
+import os
+import sys
 import numpy as np
 from typing import Optional
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+try:
+    from control.adrc_controller import ADRC
+    _ADRC_AVAILABLE = True
+except ImportError:
+    _ADRC_AVAILABLE = False
 
 
 MAX_DEFLECTION = 0.4  # meters — physical limit of control ropes
@@ -144,26 +156,76 @@ class ExcitationSignal(ControlPolicy):
 
 class NoisyControllerPolicy(ControlPolicy):
     """
-    Wraps the ADRC controller with additive exploration noise.
-    Requires a reference trajectory for the controller to track.
+    Uses the real ADRC heading controller with additive exploration noise.
+    Periodically changes the target heading to produce diverse closed-loop data.
+    Falls back to small constant deflection + noise if ADRC is unavailable.
     """
 
-    def __init__(self, controller, noise_std: float = 0.03,
-                 rng: Optional[np.random.Generator] = None):
-        self.controller = controller
+    # How often (seconds) to pick a new random target heading
+    _HEADING_CHANGE_INTERVAL = (10.0, 30.0)
+
+    def __init__(self, controller=None, noise_std: float = 0.03,
+                 rng: Optional[np.random.Generator] = None,
+                 dt: float = 0.01):
         self.noise_std = noise_std
         self.rng = rng or np.random.default_rng()
+        self.dt = dt
+
+        self._target_heading: Optional[float] = None
+        self._next_heading_change: float = 0.0
+
+        if _ADRC_AVAILABLE:
+            self._adrc = ADRC(
+                td_r=30.0,
+                td_h=dt,
+                eso_omega=20.0,
+                eso_order=2,
+                use_linear_eso=True,
+                kp=2.0,
+                kd=0.5,
+                use_linear_sef=True,
+                b0=0.5,
+                u_min=-MAX_DEFLECTION,
+                u_max=MAX_DEFLECTION,
+            )
+        else:
+            self._adrc = None
 
     def reset(self):
-        pass
+        self._target_heading = None
+        self._next_heading_change = 0.0
+        if self._adrc is not None:
+            self._adrc.reset()
 
     def step(self, state: np.ndarray, t: float) -> np.ndarray:
-        # The controller interface expects to be called externally;
-        # this is a placeholder — actual integration uses closed_loop_sim.
         noise = self.rng.normal(0, self.noise_std, size=2)
-        # Default: small symmetric deflection + noise
-        base = np.array([0.05, 0.05])
-        return np.clip(base + noise, 0, MAX_DEFLECTION)
+
+        if self._adrc is None:
+            # Fallback: small symmetric deflection + noise
+            base = np.array([0.05, 0.05])
+            return np.clip(base + noise, 0, MAX_DEFLECTION)
+
+        # Periodically pick a new random target heading
+        if self._target_heading is None or t >= self._next_heading_change:
+            self._target_heading = self.rng.uniform(-np.pi, np.pi)
+            interval = self.rng.uniform(*self._HEADING_CHANGE_INTERVAL)
+            self._next_heading_change = t + interval
+
+        current_heading = float(state[5])  # psi from 20D state vector
+
+        # ADRC heading control → differential deflection [-MAX, MAX]
+        delta_diff = self._adrc.update(self._target_heading, current_heading, self.dt)
+
+        # Convert to [left, right] deflection (same logic as ParafoilADRCController)
+        if delta_diff > 0:
+            delta_left, delta_right = 0.0, delta_diff
+        elif delta_diff < 0:
+            delta_left, delta_right = -delta_diff, 0.0
+        else:
+            delta_left, delta_right = 0.0, 0.0
+
+        u = np.array([delta_left, delta_right]) + noise
+        return np.clip(u, 0, MAX_DEFLECTION)
 
 
 def make_control_policy(policy_type: str, rng: np.random.Generator,
@@ -174,7 +236,7 @@ def make_control_policy(policy_type: str, rng: np.random.Generator,
     elif policy_type == "excitation":
         return ExcitationSignal(rng, dt)
     elif policy_type == "noisy_controller":
-        return NoisyControllerPolicy(None, rng=rng)
+        return NoisyControllerPolicy(rng=rng, dt=dt)
     else:
         raise ValueError(f"Unknown policy type: {policy_type}")
 
