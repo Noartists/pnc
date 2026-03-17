@@ -29,6 +29,8 @@ def load_config_from_yaml(yaml_path: str, overrides: dict) -> TrainConfig:
     training = cfg.get("training", {})
     loss = cfg.get("loss", {})
 
+    rollout = cfg.get("rollout", {})
+
     tc = TrainConfig(
         h5_path=data.get("h5_path", "learning/datasets/pilot.h5"),
         norm_stats_path=data.get("h5_path", "learning/datasets/pilot.h5").replace(".h5", "_norm.npz"),
@@ -51,6 +53,11 @@ def load_config_from_yaml(yaml_path: str, overrides: dict) -> TrainConfig:
         horizon_decay=loss.get("horizon_decay", 0.95),
         loss_type=loss.get("loss_type", "huber"),
         huber_delta=loss.get("huber_delta", 1.0),
+        channel_weights=loss.get("channel_weights", None),
+        rollout_loss_enabled=rollout.get("enabled", False),
+        rollout_weight=rollout.get("weight", 0.5),
+        rollout_warmup_epochs=rollout.get("warmup_epochs", 10),
+        rollout_steps=rollout.get("steps", 0),
     )
 
     # CLI overrides

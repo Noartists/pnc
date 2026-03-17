@@ -1,12 +1,13 @@
 # Quick test: validate full pipeline with small dataset
-# Train: python -m learning.train --config learning/configs/test.yaml
+# Generate: python -m learning.data_generation.dataset_generator --n-trajs 200 --traj-length 500 --subsample-step 10 --dataset-name test
+# Train:    python -m learning.train --config learning/configs/test.yaml --tensorboard
 
 data:
   h5_path: learning/datasets/test.h5
   dataset_name: test
   n_trajectories: 200
   traj_length_steps: 500
-  dt: 0.01
+  dt: 0.1
 
 model:
   d_model: 64
@@ -32,3 +33,6 @@ loss:
   horizon_decay: 0.95
   loss_type: huber
   huber_delta: 1.0
+
+rollout:
+  enabled: false

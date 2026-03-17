@@ -197,6 +197,31 @@ class InContextDynamicsTransformer(nn.Module):
 
         return predictions
 
+    def predict_single_step(self, context: torch.Tensor,
+                            padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Predict only the next single step (used by rollout loss).
+
+        Args:
+            context: (B, K, token_dim)
+        Returns:
+            delta: (B, target_dim) — predicted state delta for step 1 only
+        """
+        B = context.size(0)
+
+        x = self.input_proj(context)
+        x = self.pos_enc(x)
+        memory = self.transformer(x, src_key_padding_mask=padding_mask)
+
+        query = self.horizon_queries[:, :1, :].expand(B, -1, -1)  # (B, 1, d_model)
+        attn_out, _ = self.cross_attn(query, memory, memory,
+                                       key_padding_mask=padding_mask)
+        query = self.cross_norm(query + attn_out)
+        query = self.cross_ff_norm(query + self.cross_ff(query))
+
+        head_idx = 0 if self.config.shared_output_head else 0
+        return self.output_heads[head_idx](query[:, 0, :])  # (B, target_dim)
+
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 

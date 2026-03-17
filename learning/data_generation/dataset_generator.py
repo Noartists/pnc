@@ -83,6 +83,9 @@ class GenerationConfig:
     # Parallelism
     n_workers: int = 0   # 0 = auto (cpu_count - 1)
 
+    # Save settings
+    save_subsample_step: int = 1  # downsample when saving (1=no change, 10=dt_eff=0.1s)
+
     # Stability
     max_derivative_threshold: float = 1e6
     max_state_threshold: float = 1e5
@@ -324,6 +327,11 @@ class DatasetGenerator:
         print(f"Generating {n} trajectories with {n_workers} workers...")
         print(f"  Steps per trajectory: {cfg.traj_length_steps}")
         print(f"  dt={cfg.dt}s, control_dt={cfg.control_dt}s")
+        if cfg.save_subsample_step > 1:
+            eff_dt = cfg.control_dt * cfg.save_subsample_step
+            eff_steps = cfg.traj_length_steps // cfg.save_subsample_step
+            print(f"  Subsample: every {cfg.save_subsample_step} steps → "
+                  f"effective dt={eff_dt}s, ~{eff_steps} saved steps/traj")
         print(f"  Domain randomization: {cfg.randomize_params}")
 
         args_list = [
@@ -384,32 +392,41 @@ class DatasetGenerator:
                             f"{self.cfg.dataset_name}.h5")
 
         valid_results = [r for r in results if r is not None and r["success"]]
+        ss = self.cfg.save_subsample_step
+        effective_dt = self.cfg.control_dt * ss
+
+        if ss > 1:
+            print(f"  Subsampling: every {ss} steps → effective dt={effective_dt}s")
 
         with h5py.File(path, "w") as f:
-            # Global config
             config_grp = f.create_group("config")
             config_grp.attrs["n_trajectories"] = len(valid_results)
-            config_grp.attrs["dt"] = self.cfg.dt
-            config_grp.attrs["control_dt"] = self.cfg.control_dt
+            config_grp.attrs["dt"] = effective_dt
+            config_grp.attrs["control_dt"] = effective_dt
+            config_grp.attrs["ode_dt"] = self.cfg.dt
+            config_grp.attrs["save_subsample_step"] = ss
             config_grp.attrs["state_dim"] = 20
             config_grp.attrs["action_dim"] = 2
 
-            # Trajectories
             traj_grp = f.create_group("trajectories")
             for i, r in enumerate(valid_results):
+                states = r["states"][::ss]
+                observed = r["observed_states"][::ss]
+                actions = r["actions"][::ss]
+                winds_arr = r["winds"][::ss]
+
                 g = traj_grp.create_group(f"traj_{i:06d}")
-                g.create_dataset("states", data=r["states"],
+                g.create_dataset("states", data=states,
                                  compression="gzip", compression_opts=4)
-                g.create_dataset("observed_states", data=r["observed_states"],
+                g.create_dataset("observed_states", data=observed,
                                  compression="gzip", compression_opts=4)
-                g.create_dataset("actions", data=r["actions"],
+                g.create_dataset("actions", data=actions,
                                  compression="gzip", compression_opts=4)
-                g.create_dataset("winds", data=r["winds"],
+                g.create_dataset("winds", data=winds_arr,
                                  compression="gzip", compression_opts=4)
-                g.attrs["valid_steps"] = r["valid_steps"]
+                g.attrs["valid_steps"] = len(states)
                 g.attrs["reason"] = r["reason"]
                 g.attrs["seed"] = r["seed"]
-                # Meta as JSON string
                 g.attrs["meta"] = json.dumps(r["meta"], default=_json_default)
 
         return path
@@ -482,6 +499,8 @@ def main():
                         choices=["constant", "ar1"])
     parser.add_argument("--no-sensor-noise", action="store_true",
                         help="Disable sensor noise")
+    parser.add_argument("--subsample-step", type=int, default=1,
+                        help="Downsample factor when saving (10 → dt_eff=0.1s)")
 
     args = parser.parse_args()
 
@@ -495,6 +514,7 @@ def main():
         randomize_params=not args.no_randomize,
         wind_config=WindConfig(mode=args.wind_mode),
         sensor_noise_config=SensorNoiseConfig(enabled=not args.no_sensor_noise),
+        save_subsample_step=args.subsample_step,
     )
 
     generator = DatasetGenerator(cfg)

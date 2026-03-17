@@ -271,6 +271,8 @@ class ParafoilDynamicsDataset(Dataset):
             "context": torch.from_numpy(context),
             "target": torch.from_numpy(target),
             "current_state": torch.from_numpy(current_state),
+            "raw_states": torch.from_numpy(states.astype(np.float32)),     # (K+H+1, 20)
+            "raw_actions": torch.from_numpy(actions.astype(np.float32)),   # (K+H, 2)
         }
 
     def __del__(self):

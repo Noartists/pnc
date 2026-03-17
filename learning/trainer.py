@@ -32,6 +32,7 @@ from learning.model import InContextDynamicsTransformer, ModelConfig
 from learning.dataset import (
     ParafoilDynamicsDataset, NormalizationStats,
     compute_normalization_stats, create_dataloaders,
+    encode_state_token, encode_state_delta,
     TOKEN_DIM, TARGET_DIM,
 )
 
@@ -69,6 +70,12 @@ class TrainConfig:
     # euler(3), rel_angles(2), vel_canopy(3), omega_canopy(3),
     # vel_payload(3), omega_payload(3)
     channel_weights: Optional[List[float]] = None
+
+    # Rollout loss (autoregressive)
+    rollout_loss_enabled: bool = False
+    rollout_weight: float = 0.5        # total = (1-α)*tf_loss + α*rollout_loss
+    rollout_warmup_epochs: int = 10    # only teacher forcing for the first N epochs
+    rollout_steps: int = 0             # 0 = use prediction_horizon
 
     # Curriculum
     curriculum_enabled: bool = True
@@ -230,10 +237,13 @@ class Trainer:
         if config.channel_weights:
             channel_weights = torch.tensor(config.channel_weights, dtype=torch.float32)
         else:
-            # Default: upweight angular velocities
-            # euler(3), rel(2), v_c(3), w_c(3), v_p(3), w_p(3) = 17
+            # Default weights by control importance:
+            # dφ(1.5) dθ(1.5) dψ(3.0) | dθr(1.0) dψr(1.0) |
+            # du(2.5) dv(2.5) dw(2.5) | dp(2.0) dq(2.0) dr(2.0) |
+            # du_p(1.5) dv_p(1.5) dw_p(1.5) | dp_p(1.0) dq_p(1.0) dr_p(1.0)
             channel_weights = torch.tensor(
-                [1.0]*3 + [1.0]*2 + [1.0]*3 + [2.0]*3 + [1.0]*3 + [2.0]*3,
+                [1.5, 1.5, 3.0,  1.0, 1.0,  2.5, 2.5, 2.5,
+                 2.0, 2.0, 2.0,  1.5, 1.5, 1.5,  1.0, 1.0, 1.0],
                 dtype=torch.float32
             )
         self.loss_fn = MultiStepLoss(
@@ -288,6 +298,9 @@ class Trainer:
         if cfg.curriculum_enabled:
             print(f"  Curriculum: H starts at {cfg.curriculum_start_H}, "
                   f"+1 every {cfg.curriculum_epoch_per_step} epochs")
+        if cfg.rollout_loss_enabled:
+            print(f"  Rollout loss: weight={cfg.rollout_weight}, "
+                  f"warmup={cfg.rollout_warmup_epochs} epochs")
         print()
 
         for epoch in range(self.epoch, cfg.max_epochs):
@@ -307,12 +320,14 @@ class Trainer:
 
             # Validate
             val_loss = None
+            curriculum_complete = (active_H >= cfg.prediction_horizon)
             if (epoch + 1) % cfg.val_every_n_epochs == 0:
                 val_loss = self._validate(active_H)
 
-                if val_loss < self.best_val_loss:
+                if curriculum_complete and val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self._save_checkpoint("best.pt")
+                    print(f"  ** New best val loss: {val_loss:.6f}")
 
             # Log
             lr = self.optimizer.param_groups[0]['lr']
@@ -350,19 +365,33 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         n_batches = 0
+        cfg = self.cfg
+
+        use_rollout = (
+            cfg.rollout_loss_enabled
+            and self.epoch >= cfg.rollout_warmup_epochs
+            and active_H >= cfg.prediction_horizon
+        )
 
         for batch in self.train_loader:
             context = batch["context"].to(self.device)
             target = batch["target"].to(self.device)
 
             pred = self.model(context)
-            loss = self.loss_fn(pred, target, active_horizon=active_H)
+            tf_loss = self.loss_fn(pred, target, active_horizon=active_H)
+
+            if use_rollout:
+                r_loss = self._compute_rollout_loss(batch, active_H)
+                alpha = cfg.rollout_weight
+                loss = (1 - alpha) * tf_loss + alpha * r_loss
+            else:
+                loss = tf_loss
 
             self.optimizer.zero_grad()
             loss.backward()
-            if self.cfg.grad_clip > 0:
+            if cfg.grad_clip > 0:
                 nn.utils.clip_grad_norm_(self.model.parameters(),
-                                         self.cfg.grad_clip)
+                                         cfg.grad_clip)
             self.optimizer.step()
             self.scheduler.step()
 
@@ -389,6 +418,67 @@ class Trainer:
             n_batches += 1
 
         return total_loss / max(1, n_batches)
+
+    def _compute_rollout_loss(self, batch: dict, active_H: int) -> torch.Tensor:
+        """
+        Autoregressive rollout loss: predict one step at a time,
+        feed prediction back into context, accumulate errors.
+        """
+        raw_states = batch["raw_states"].to(self.device)    # (B, K+H+1, 20)
+        raw_actions = batch["raw_actions"].to(self.device)  # (B, K+H, 2)
+        context = batch["context"].to(self.device)          # (B, K, TOKEN_DIM)
+        target = batch["target"].to(self.device)            # (B, H, TARGET_DIM)
+
+        B, K, _ = context.shape
+        H = active_H
+        rollout_H = min(H, self.cfg.rollout_steps or H)
+
+        norm = self.norm_stats
+        target_std = torch.from_numpy(
+            np.concatenate([norm.state_std[3:20]])
+        ).float().to(self.device)
+
+        pred_deltas = []
+        current_context = context.clone()
+        current_state = raw_states[:, K, :].clone()  # (B, 20)
+
+        for h in range(rollout_H):
+            pred_delta_norm = self.model.predict_single_step(current_context)  # (B, TARGET_DIM)
+            pred_deltas.append(pred_delta_norm)
+
+            # Denormalize delta and apply to state
+            pred_delta_raw = pred_delta_norm * target_std.unsqueeze(0)
+            next_state = current_state.clone()
+            next_state[:, 3:20] = next_state[:, 3:20] + pred_delta_raw
+
+            # Build new token from predicted state + ground truth action
+            action_idx = K + h
+            action_h = raw_actions[:, action_idx, :]  # (B, 2)
+
+            new_tokens = []
+            for b in range(B):
+                tok = encode_state_token(
+                    next_state[b].detach().cpu().numpy(),
+                    action_h[b].detach().cpu().numpy(),
+                    norm,
+                )
+                new_tokens.append(tok)
+            new_token = torch.from_numpy(
+                np.stack(new_tokens)
+            ).float().to(self.device)  # (B, TOKEN_DIM)
+
+            # Shift context: drop oldest, append new token
+            current_context = torch.cat([
+                current_context[:, 1:, :],
+                new_token.unsqueeze(1),
+            ], dim=1)
+
+            current_state = next_state
+
+        pred_stack = torch.stack(pred_deltas, dim=1)  # (B, rollout_H, TARGET_DIM)
+        target_slice = target[:, :rollout_H, :]
+
+        return self.loss_fn(pred_stack, target_slice, active_horizon=rollout_H)
 
     def _save_checkpoint(self, filename: str):
         path = os.path.join(self.ckpt_dir, filename)

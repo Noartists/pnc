@@ -45,12 +45,16 @@ class EvalSplit:
     gen_config: GenerationConfig
 
 
+EVAL_SUBSAMPLE_STEP = 10   # match training data dt=0.1s
+
+
 def make_iid_split(n: int = 200, seed_offset: int = 100000) -> EvalSplit:
     """In-distribution test set (same param/wind ranges as training)."""
     cfg = GenerationConfig(
         n_trajectories=n,
         dataset_name="eval_iid",
         traj_length_steps=2000,
+        save_subsample_step=EVAL_SUBSAMPLE_STEP,
     )
     return EvalSplit("IID", "In-distribution test", cfg)
 
@@ -60,13 +64,14 @@ def make_ood_param_split(n: int = 200) -> EvalSplit:
     from learning.data_generation.domain_randomization import PARAM_PERTURBATION_SPEC
     ood_spec = {}
     for k, v in PARAM_PERTURBATION_SPEC.items():
-        ood_spec[k] = min(v * 1.8, 0.45)  # ~1.8x wider range
+        ood_spec[k] = min(v * 1.8, 0.45)
 
     cfg = GenerationConfig(
         n_trajectories=n,
         dataset_name="eval_ood_param",
         traj_length_steps=2000,
         param_perturbation_spec=ood_spec,
+        save_subsample_step=EVAL_SUBSAMPLE_STEP,
     )
     return EvalSplit("OOD-Param", "Out-of-distribution parameters", cfg)
 
@@ -79,9 +84,10 @@ def make_ood_wind_split(n: int = 200) -> EvalSplit:
         traj_length_steps=2000,
         wind_config=WindConfig(
             mode="ar1",
-            speed_range=(5.0, 10.0),   # training uses 0-5 m/s
-            ar1_sigma=0.6,             # stronger turbulence
+            speed_range=(5.0, 10.0),
+            ar1_sigma=0.6,
         ),
+        save_subsample_step=EVAL_SUBSAMPLE_STEP,
     )
     return EvalSplit("OOD-Wind", "Out-of-distribution wind", cfg)
 

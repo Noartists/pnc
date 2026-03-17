@@ -1,20 +1,20 @@
 # Pilot experiment: small-scale validation (Phase 2)
-# Generate: python -m learning.data_generation.dataset_generator --n-trajectories 1000 --dataset-name pilot
-# Train:   python -m learning.train --config learning/configs/pilot.yaml
+# Generate: python -m learning.data_generation.dataset_generator --n-trajs 5000 --traj-length 2000 --subsample-step 10 --dataset-name pilot
+# Train:   python -m learning.train --config learning/configs/pilot.yaml --tensorboard
 
 data:
   h5_path: learning/datasets/pilot.h5
   dataset_name: pilot
-  n_trajectories: 1000
+  n_trajectories: 5000
   traj_length_steps: 2000
-  dt: 0.01
+  dt: 0.1    # effective dt after 10x subsample
 
 model:
   d_model: 128
   n_heads: 4
   n_layers: 4
   d_ff: 512
-  dropout: 0.1
+  dropout: 0.15
   context_length: 50
   prediction_horizon: 20
 
@@ -22,8 +22,8 @@ training:
   batch_size: 64
   learning_rate: 3.0e-4
   weight_decay: 1.0e-4
-  max_epochs: 50
-  warmup_steps: 200
+  max_epochs: 80
+  warmup_steps: 300
   grad_clip: 1.0
   curriculum_enabled: true
   curriculum_start_H: 1
@@ -33,3 +33,10 @@ loss:
   horizon_decay: 0.95
   loss_type: huber
   huber_delta: 1.0
+  channel_weights: [1.5, 1.5, 3.0, 1.0, 1.0, 2.5, 2.5, 2.5, 2.0, 2.0, 2.0, 1.5, 1.5, 1.5, 1.0, 1.0, 1.0]
+
+rollout:
+  enabled: true
+  weight: 0.5
+  warmup_epochs: 10
+  steps: 0    # 0 = use prediction_horizon
