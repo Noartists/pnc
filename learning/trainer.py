@@ -13,16 +13,13 @@ Features:
 
 import os
 import sys
-import time
-import json
 import math
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, List
+from typing import Optional, List, Dict, Any
+from tqdm import tqdm
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -30,10 +27,9 @@ if ROOT_DIR not in sys.path:
 
 from learning.model import InContextDynamicsTransformer, ModelConfig
 from learning.dataset import (
-    ParafoilDynamicsDataset, NormalizationStats,
-    compute_normalization_stats, create_dataloaders,
-    encode_state_token, encode_state_delta,
-    TOKEN_DIM, TARGET_DIM,
+    NormalizationStats, compute_normalization_stats, create_dataloaders,
+    BatchEncoder, TOKEN_DIM, TARGET_DIM,
+    WIND_LABEL_DIM, PARAM_LABEL_DIM,
 )
 
 
@@ -60,6 +56,7 @@ class TrainConfig:
     max_epochs: int = 100
     warmup_steps: int = 500
     grad_clip: float = 1.0
+    use_amp: bool = True
 
     # Loss
     horizon_decay: float = 0.95    # lambda_i = decay^i
@@ -73,9 +70,15 @@ class TrainConfig:
 
     # Rollout loss (autoregressive)
     rollout_loss_enabled: bool = False
-    rollout_weight: float = 0.5        # total = (1-α)*tf_loss + α*rollout_loss
-    rollout_warmup_epochs: int = 10    # only teacher forcing for the first N epochs
-    rollout_steps: int = 0             # 0 = use prediction_horizon
+    rollout_weight: float = 0.5
+    rollout_warmup_epochs: int = 10
+    rollout_steps: int = 0
+
+    # Auxiliary task-identification loss
+    aux_loss_enabled: bool = False
+    aux_loss_weight: float = 0.1
+    aux_predict_wind: bool = True
+    aux_predict_params: bool = False
 
     # Curriculum
     curriculum_enabled: bool = True
@@ -87,6 +90,7 @@ class TrainConfig:
     samples_per_traj: int = 10
     train_ratio: float = 0.9
     num_workers: int = 4
+    preload_dataset: bool = True  # load split into RAM; faster, uses more memory
 
     # Checkpointing
     checkpoint_dir: str = "learning/checkpoints"
@@ -189,6 +193,14 @@ class Trainer:
             self.norm_stats.save(self.norm_path)
             print(f"Saved normalization stats to {self.norm_path}")
 
+        # Auxiliary loss dimensions
+        self.aux_dim = 0
+        if config.aux_loss_enabled:
+            if config.aux_predict_wind:
+                self.aux_dim += WIND_LABEL_DIM
+            if config.aux_predict_params:
+                self.aux_dim += PARAM_LABEL_DIM
+
         # Data loaders
         self.train_loader, self.val_loader = create_dataloaders(
             self.h5_path, self.norm_stats,
@@ -198,9 +210,20 @@ class Trainer:
             train_ratio=config.train_ratio,
             num_workers=config.num_workers,
             samples_per_traj=config.samples_per_traj,
+            load_aux_labels=config.aux_loss_enabled,
+            preload=config.preload_dataset,
         )
-        print(f"Train samples: {len(self.train_loader.dataset)}, "
-              f"Val samples: {len(self.val_loader.dataset)}")
+        tr_ds, va_ds = self.train_loader.dataset, self.val_loader.dataset
+        print(f"Train samples: {len(tr_ds)}, Val samples: {len(va_ds)}")
+        if config.preload_dataset and getattr(tr_ds, "_states_list", None):
+            def _ram_mb(ds):
+                if not ds._states_list:
+                    return 0.0
+                s = sum(a.nbytes for a in ds._states_list)
+                a = sum(a.nbytes for a in ds._actions_list)
+                w = sum(a.nbytes for a in ds._winds_list) if ds._winds_list else 0
+                return (s + a + w) / (1024 ** 2)
+            print(f"  Dataset in RAM ≈ train {_ram_mb(tr_ds):.0f} MB + val {_ram_mb(va_ds):.0f} MB")
 
         # Model
         model_cfg = ModelConfig(
@@ -215,9 +238,15 @@ class Trainer:
             prediction_horizon=config.prediction_horizon,
             proj_hidden=config.d_model,
         )
-        self.model = InContextDynamicsTransformer(model_cfg).to(self.device)
+        self.model = InContextDynamicsTransformer(
+            model_cfg, aux_dim=self.aux_dim
+        ).to(self.device)
         n_params = self.model.count_parameters()
         print(f"Model parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+        if config.aux_loss_enabled:
+            print(f"  Aux head: dim={self.aux_dim} "
+                  f"(wind={config.aux_predict_wind}, "
+                  f"params={config.aux_predict_params})")
 
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -253,6 +282,15 @@ class Trainer:
             huber_delta=config.huber_delta,
             channel_weights=channel_weights,
         ).to(self.device)
+
+        # AMP
+        self.use_amp = config.use_amp and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        if self.use_amp:
+            print("Mixed precision (AMP) enabled")
+
+        # GPU batch encoder (replaces per-sample NumPy loops)
+        self.encoder = BatchEncoder(self.norm_stats, self.device)
 
         # State
         self.epoch = 0
@@ -301,9 +339,14 @@ class Trainer:
         if cfg.rollout_loss_enabled:
             print(f"  Rollout loss: weight={cfg.rollout_weight}, "
                   f"warmup={cfg.rollout_warmup_epochs} epochs")
+        if cfg.aux_loss_enabled:
+            print(f"  Aux loss: weight={cfg.aux_loss_weight}")
         print()
 
-        for epoch in range(self.epoch, cfg.max_epochs):
+        epoch_pbar = tqdm(range(self.epoch, cfg.max_epochs),
+                          desc="Training", unit="epoch",
+                          initial=self.epoch, total=cfg.max_epochs)
+        for epoch in epoch_pbar:
             self.epoch = epoch
 
             # Curriculum: determine active horizon
@@ -316,7 +359,8 @@ class Trainer:
                 active_H = cfg.prediction_horizon
 
             # Train
-            train_loss = self._train_epoch(active_H)
+            train_stats = self._train_epoch(active_H)
+            train_loss = train_stats["total"]
 
             # Validate
             val_loss = None
@@ -327,28 +371,58 @@ class Trainer:
                 if curriculum_complete and val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self._save_checkpoint("best.pt")
-                    print(f"  ** New best val loss: {val_loss:.6f}")
+                    tqdm.write(f"  ** New best val loss: {val_loss:.6f}")
 
             # Log
             lr = self.optimizer.param_groups[0]['lr']
-            msg = (f"Epoch {epoch+1:3d}/{cfg.max_epochs} | "
-                   f"H={active_H:2d} | "
-                   f"train_loss={train_loss:.6f} | "
-                   f"lr={lr:.2e}")
+            postfix = {"H": active_H, "train": f"{train_loss:.5f}", "lr": f"{lr:.2e}"}
             if val_loss is not None:
-                msg += f" | val_loss={val_loss:.6f}"
-            print(msg)
+                postfix["val"] = f"{val_loss:.5f}"
+            epoch_pbar.set_postfix(postfix)
 
             if self.tb_writer:
-                self.tb_writer.add_scalar("train/loss", train_loss, self.global_step)
-                self.tb_writer.add_scalar("train/lr", lr, self.global_step)
-                self.tb_writer.add_scalar("train/active_H", active_H, self.global_step)
+                ep = epoch + 1
+                gs = self.global_step
+                self.tb_writer.add_scalar("train/loss", train_loss, gs)
+                self.tb_writer.add_scalar("train/lr", lr, gs)
+                self.tb_writer.add_scalar("train/active_H", active_H, gs)
                 if val_loss is not None:
-                    self.tb_writer.add_scalar("val/loss", val_loss, self.global_step)
+                    self.tb_writer.add_scalar("val/loss", val_loss, gs)
+                # 分项（step 轴，每 epoch 一点）
+                self.tb_writer.add_scalar("train/loss_tf", train_stats["tf"], gs)
+                self.tb_writer.add_scalar(
+                    "train/loss_rollout", train_stats["rollout"], gs
+                )
+                self.tb_writer.add_scalar("train/loss_aux", train_stats["aux"], gs)
+                self.tb_writer.add_scalar(
+                    "train/loss_aux_weighted", train_stats["aux_weighted"], gs
+                )
+                # 按 epoch 横轴 1,2,3…
+                self.tb_writer.add_scalar("epoch/loss_total", train_loss, ep)
+                self.tb_writer.add_scalar("epoch/loss_tf", train_stats["tf"], ep)
+                self.tb_writer.add_scalar(
+                    "epoch/loss_rollout", train_stats["rollout"], ep
+                )
+                self.tb_writer.add_scalar("epoch/loss_aux", train_stats["aux"], ep)
+                self.tb_writer.add_scalar(
+                    "epoch/loss_aux_weighted", train_stats["aux_weighted"], ep
+                )
+                self.tb_writer.add_scalar("epoch/lr", lr, ep)
+                self.tb_writer.add_scalar("epoch/active_H", float(active_H), ep)
+                if val_loss is not None:
+                    self.tb_writer.add_scalar("epoch/val_loss", val_loss, ep)
 
             if self.wandb_run:
-                log = {"train/loss": train_loss, "train/lr": lr,
-                       "train/active_H": active_H, "epoch": epoch}
+                log = {
+                    "train/loss": train_loss,
+                    "train/loss_tf": train_stats["tf"],
+                    "train/loss_rollout": train_stats["rollout"],
+                    "train/loss_aux": train_stats["aux"],
+                    "train/loss_aux_weighted": train_stats["aux_weighted"],
+                    "train/lr": lr,
+                    "train/active_H": active_H,
+                    "epoch": epoch,
+                }
                 if val_loss is not None:
                     log["val/loss"] = val_loss
                 self.wandb_run.log(log, step=self.global_step)
@@ -361,9 +435,21 @@ class Trainer:
         self._save_checkpoint("final.pt")
         print(f"\nTraining complete. Best val loss: {self.best_val_loss:.6f}")
 
-    def _train_epoch(self, active_H: int) -> float:
+    def _build_aux_label(self, batch: dict) -> torch.Tensor:
+        """Concatenate wind and/or param labels into a single target vector."""
+        parts = []
+        if self.cfg.aux_predict_wind and "wind_label" in batch:
+            parts.append(batch["wind_label"])
+        if self.cfg.aux_predict_params and "param_label" in batch:
+            parts.append(batch["param_label"])
+        return torch.cat(parts, dim=-1).to(self.device) if parts else None
+
+    def _train_epoch(self, active_H: int) -> Dict[str, Any]:
         self.model.train()
         total_loss = 0.0
+        sum_tf = 0.0
+        sum_rollout = 0.0
+        sum_aux = 0.0
         n_batches = 0
         cfg = self.cfg
 
@@ -372,102 +458,125 @@ class Trainer:
             and self.epoch >= cfg.rollout_warmup_epochs
             and active_H >= cfg.prediction_horizon
         )
+        use_aux = cfg.aux_loss_enabled and self.aux_dim > 0
 
-        for batch in self.train_loader:
-            context = batch["context"].to(self.device)
-            target = batch["target"].to(self.device)
+        K = cfg.context_length
+        batch_pbar = tqdm(self.train_loader, desc=f"  Train E{self.epoch+1}",
+                          leave=False, unit="batch")
+        for batch in batch_pbar:
+            raw_s = batch["raw_states"].to(self.device, non_blocking=True)
+            raw_a = batch["raw_actions"].to(self.device, non_blocking=True)
 
-            pred = self.model(context)
-            tf_loss = self.loss_fn(pred, target, active_horizon=active_H)
+            context = self.encoder.encode_tokens(raw_s[:, :K], raw_a[:, :K])
+            target = self.encoder.encode_deltas(
+                raw_s[:, K:K+active_H], raw_s[:, K+1:K+active_H+1]
+            )
 
-            if use_rollout:
-                r_loss = self._compute_rollout_loss(batch, active_H)
-                alpha = cfg.rollout_weight
-                loss = (1 - alpha) * tf_loss + alpha * r_loss
-            else:
-                loss = tf_loss
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                if use_aux:
+                    pred, aux_pred = self.model(context, return_aux=True)
+                    aux_label = self._build_aux_label(batch)
+                    aux_loss = nn.functional.mse_loss(aux_pred, aux_label)
+                    sum_aux += float(aux_loss.detach())
+                else:
+                    pred = self.model(context)
+                    aux_loss = torch.zeros((), device=self.device)
+
+                tf_loss = self.loss_fn(pred, target, active_horizon=active_H)
+
+                if use_rollout:
+                    r_loss = self._compute_rollout_loss(
+                        raw_s, raw_a, context, target, active_H
+                    )
+                    sum_rollout += float(r_loss.detach())
+                    alpha = cfg.rollout_weight
+                    loss = (1 - alpha) * tf_loss + alpha * r_loss
+                else:
+                    loss = tf_loss
+
+                loss = loss + cfg.aux_loss_weight * aux_loss
+
+            sum_tf += float(tf_loss.detach())
 
             self.optimizer.zero_grad()
-            loss.backward()
+            self.scaler.scale(loss).backward()
             if cfg.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(),
                                          cfg.grad_clip)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             self.scheduler.step()
 
             total_loss += loss.item()
             n_batches += 1
             self.global_step += 1
+            batch_pbar.set_postfix(loss=f"{loss.item():.5f}")
 
-        return total_loss / max(1, n_batches)
+        n = max(1, n_batches)
+        avg_aux = sum_aux / n
+        return {
+            "total": total_loss / n,
+            "tf": sum_tf / n,
+            "rollout": sum_rollout / n if use_rollout else 0.0,
+            "aux": avg_aux if use_aux else 0.0,
+            "aux_weighted": (cfg.aux_loss_weight * avg_aux) if use_aux else 0.0,
+        }
 
     @torch.no_grad()
     def _validate(self, active_H: int) -> float:
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
+        K = self.cfg.context_length
 
-        for batch in self.val_loader:
-            context = batch["context"].to(self.device)
-            target = batch["target"].to(self.device)
+        val_pbar = tqdm(self.val_loader, desc=f"  Val   E{self.epoch+1}",
+                        leave=False, unit="batch")
+        for batch in val_pbar:
+            raw_s = batch["raw_states"].to(self.device, non_blocking=True)
+            raw_a = batch["raw_actions"].to(self.device, non_blocking=True)
 
-            pred = self.model(context)
-            loss = self.loss_fn(pred, target, active_horizon=active_H)
+            context = self.encoder.encode_tokens(raw_s[:, :K], raw_a[:, :K])
+            target = self.encoder.encode_deltas(
+                raw_s[:, K:K+active_H], raw_s[:, K+1:K+active_H+1]
+            )
+
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                pred = self.model(context)
+                loss = self.loss_fn(pred, target, active_horizon=active_H)
 
             total_loss += loss.item()
             n_batches += 1
+            val_pbar.set_postfix(loss=f"{total_loss/n_batches:.5f}")
 
         return total_loss / max(1, n_batches)
 
-    def _compute_rollout_loss(self, batch: dict, active_H: int) -> torch.Tensor:
+    def _compute_rollout_loss(self, raw_states: torch.Tensor,
+                              raw_actions: torch.Tensor,
+                              context: torch.Tensor,
+                              target: torch.Tensor,
+                              active_H: int) -> torch.Tensor:
         """
-        Autoregressive rollout loss: predict one step at a time,
-        feed prediction back into context, accumulate errors.
+        Autoregressive rollout loss — fully on GPU, no Python loops over batch.
         """
-        raw_states = batch["raw_states"].to(self.device)    # (B, K+H+1, 20)
-        raw_actions = batch["raw_actions"].to(self.device)  # (B, K+H, 2)
-        context = batch["context"].to(self.device)          # (B, K, TOKEN_DIM)
-        target = batch["target"].to(self.device)            # (B, H, TARGET_DIM)
-
         B, K, _ = context.shape
-        H = active_H
-        rollout_H = min(H, self.cfg.rollout_steps or H)
-
-        norm = self.norm_stats
-        target_std = torch.from_numpy(
-            np.concatenate([norm.state_std[3:20]])
-        ).float().to(self.device)
+        rollout_H = min(active_H, self.cfg.rollout_steps or active_H)
 
         pred_deltas = []
         current_context = context.clone()
         current_state = raw_states[:, K, :].clone()  # (B, 20)
 
         for h in range(rollout_H):
-            pred_delta_norm = self.model.predict_single_step(current_context)  # (B, TARGET_DIM)
+            pred_delta_norm = self.model.predict_single_step(current_context)
             pred_deltas.append(pred_delta_norm)
 
-            # Denormalize delta and apply to state
-            pred_delta_raw = pred_delta_norm * target_std.unsqueeze(0)
+            pred_delta_raw = pred_delta_norm * self.encoder.target_std
             next_state = current_state.clone()
             next_state[:, 3:20] = next_state[:, 3:20] + pred_delta_raw
 
-            # Build new token from predicted state + ground truth action
-            action_idx = K + h
-            action_h = raw_actions[:, action_idx, :]  # (B, 2)
+            action_h = raw_actions[:, K + h, :]  # (B, 2)
+            new_token = self.encoder.encode_tokens(next_state, action_h)  # (B, TOKEN_DIM)
 
-            new_tokens = []
-            for b in range(B):
-                tok = encode_state_token(
-                    next_state[b].detach().cpu().numpy(),
-                    action_h[b].detach().cpu().numpy(),
-                    norm,
-                )
-                new_tokens.append(tok)
-            new_token = torch.from_numpy(
-                np.stack(new_tokens)
-            ).float().to(self.device)  # (B, TOKEN_DIM)
-
-            # Shift context: drop oldest, append new token
             current_context = torch.cat([
                 current_context[:, 1:, :],
                 new_token.unsqueeze(1),
@@ -475,7 +584,7 @@ class Trainer:
 
             current_state = next_state
 
-        pred_stack = torch.stack(pred_deltas, dim=1)  # (B, rollout_H, TARGET_DIM)
+        pred_stack = torch.stack(pred_deltas, dim=1)
         target_slice = target[:, :rollout_H, :]
 
         return self.loss_fn(pred_stack, target_slice, active_horizon=rollout_H)

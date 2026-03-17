@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from typing import Optional, Callable, Tuple
+from tqdm import tqdm
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -25,7 +26,7 @@ if ROOT_DIR not in sys.path:
 from learning.model import InContextDynamicsTransformer, ModelConfig
 from learning.dataset import (
     NormalizationStats, encode_state_token, encode_state_delta,
-    TOKEN_DIM, TARGET_DIM,
+    TOKEN_DIM, TARGET_DIM, WIND_LABEL_DIM, PARAM_LABEL_DIM,
 )
 
 
@@ -333,7 +334,9 @@ class MPPIClosedLoopSim:
         actions_log = []
         state = initial_state.copy()
 
-        for step in range(max_steps):
+        step_iter = tqdm(range(max_steps), desc="MPPI sim", leave=False,
+                         unit="step") if verbose else range(max_steps)
+        for step in step_iter:
             action = self.mppi.get_action(state)
             actions_log.append(action.copy())
 
@@ -346,12 +349,12 @@ class MPPIClosedLoopSim:
 
             if state[2] < 0:
                 if verbose:
-                    print(f"  Landed at step {step}, pos=({state[0]:.1f}, {state[1]:.1f})")
+                    tqdm.write(f"  Landed at step {step}, pos=({state[0]:.1f}, {state[1]:.1f})")
                 break
 
-            if verbose and step % 200 == 0:
-                print(f"  Step {step}: alt={state[2]:.1f}m, "
-                      f"heading={np.degrees(state[5]):.1f}deg")
+            if verbose and hasattr(step_iter, 'set_postfix'):
+                step_iter.set_postfix(alt=f"{state[2]:.1f}m",
+                                      hdg=f"{np.degrees(state[5]):.1f}°")
 
         states = np.array(states)
         actions_log = np.array(actions_log)
@@ -400,7 +403,13 @@ def run_mpc_benchmark(
         prediction_horizon=train_cfg.get("prediction_horizon", 20),
         proj_hidden=train_cfg.get("d_model", 128),
     )
-    model = InContextDynamicsTransformer(model_cfg).to(device)
+    aux_dim = 0
+    if train_cfg.get("aux_loss_enabled", False):
+        if train_cfg.get("aux_predict_wind", True):
+            aux_dim += WIND_LABEL_DIM
+        if train_cfg.get("aux_predict_params", False):
+            aux_dim += PARAM_LABEL_DIM
+    model = InContextDynamicsTransformer(model_cfg, aux_dim=aux_dim).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
@@ -413,7 +422,7 @@ def run_mpc_benchmark(
     os.makedirs(output_dir, exist_ok=True)
     all_results = {"learned_mppi": [], "nominal_ode_mppi": []}
 
-    for trial in range(n_trials):
+    for trial in tqdm(range(n_trials), desc="MPC Benchmark", unit="trial"):
         rng = np.random.default_rng(trial + 1000)
         real_para, mults = randomize_params(nominal_para, rng)
 
@@ -443,7 +452,7 @@ def run_mpc_benchmark(
         learned_dynamics = LearnedDynamicsRollout(model, norm, device)
         learned_mppi = MPPIController(mppi_cfg, learned_dynamics, norm)
 
-        print(f"\nTrial {trial+1}/{n_trials} — Learned MPPI")
+        tqdm.write(f"\nTrial {trial+1}/{n_trials} — Learned MPPI")
         result_learned = MPPIClosedLoopSim(
             learned_mppi, real_plant
         ).run(y0, max_steps, target_heading, verbose=False)
@@ -451,7 +460,7 @@ def run_mpc_benchmark(
 
         # --- Nominal ODE MPPI ---
         nom_plant = ODEDynamicsRollout(nominal_para, dt=0.01)
-        print(f"Trial {trial+1}/{n_trials} — Nominal ODE MPPI")
+        tqdm.write(f"Trial {trial+1}/{n_trials} — Nominal ODE MPPI")
         # For ODE MPPI, we simulate a simple greedy approach
         # (full ODE-MPPI is slow; this is a simplified comparison)
         result_nominal = MPPIClosedLoopSim(
@@ -459,10 +468,10 @@ def run_mpc_benchmark(
         ).run(y0, max_steps, target_heading, verbose=False)
         all_results["nominal_ode_mppi"].append(result_nominal)
 
-        print(f"  Learned: alt={result_learned['final_altitude']:.1f}m, "
-              f"steps={result_learned['n_steps']}")
-        print(f"  Nominal: alt={result_nominal['final_altitude']:.1f}m, "
-              f"steps={result_nominal['n_steps']}")
+        tqdm.write(f"  Learned: alt={result_learned['final_altitude']:.1f}m, "
+                   f"steps={result_learned['n_steps']}")
+        tqdm.write(f"  Nominal: alt={result_nominal['final_altitude']:.1f}m, "
+                   f"steps={result_nominal['n_steps']}")
 
     # Save summary
     import json

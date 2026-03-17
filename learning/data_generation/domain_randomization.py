@@ -23,38 +23,38 @@ from typing import Dict, Tuple, Optional
 # Sensitive params get tighter ranges to avoid ODE divergence.
 PARAM_PERTURBATION_SPEC: Dict[str, float] = {
     # --- mass ---
-    "mc":       0.15,
-    "mp":       0.15,
+    "mc":       0.25,
+    "mp":       0.25,
     # --- geometry ---
-    "b":        0.10,
-    "Ac":       0.10,
-    "As":       0.10,
-    "Ap":       0.15,
+    "b":        0.18,
+    "Ac":       0.18,
+    "As":       0.18,
+    "Ap":       0.25,
     # --- hinge (sensitive) ---
-    "k_psi":    0.20,
-    "k_r":      0.20,
-    "k_f":      0.20,
-    "c_f":      0.15,   # pitch damping — very sensitive
+    "k_psi":    0.35,
+    "k_r":      0.35,
+    "k_f":      0.35,
+    "c_f":      0.25,
     # --- aerodynamics ---
-    "CD0":      0.20,
-    "CDa2":     0.20,
-    "CDds":     0.20,
-    "CDp":      0.20,
-    "CL0":      0.10,   # lift — sensitive to stall
-    "CLa":      0.10,
-    "CLds":     0.20,
-    "CYbeta":   0.20,
-    "Cm0":      0.20,
-    "Cma":      0.20,
-    "Cmq":      0.20,
-    "Clp":      0.20,
-    "Clbeta":   0.20,
-    "Clr":      0.30,
-    "Clda":     0.20,
-    "Cnbeta":   0.30,
-    "Cnp":      0.30,
-    "Cnr":      0.20,
-    "Cnda":     0.20,
+    "CD0":      0.35,
+    "CDa2":     0.35,
+    "CDds":     0.35,
+    "CDp":      0.35,
+    "CL0":      0.18,
+    "CLa":      0.18,
+    "CLds":     0.35,
+    "CYbeta":   0.35,
+    "Cm0":      0.35,
+    "Cma":      0.35,
+    "Cmq":      0.35,
+    "Clp":      0.35,
+    "Clbeta":   0.35,
+    "Clr":      0.45,
+    "Clda":     0.35,
+    "Cnbeta":   0.45,
+    "Cnp":      0.45,
+    "Cnr":      0.35,
+    "Cnda":     0.35,
 }
 
 
@@ -100,16 +100,19 @@ def randomize_params(para, rng: np.random.Generator,
 class WindConfig:
     """Wind randomization configuration."""
     mode: str = "ar1"            # "constant" or "ar1"
-    speed_range: Tuple[float, float] = (0.0, 5.0)   # m/s
+    speed_range: Tuple[float, float] = (0.0, 12.0)  # m/s
     ar1_alpha: float = 0.98      # AR(1) correlation coefficient
-    ar1_sigma: float = 0.3       # innovation std (m/s per axis)
-    vertical_speed_range: Tuple[float, float] = (-0.5, 0.5)
+    ar1_sigma: float = 0.5       # innovation std (m/s per axis)
+    vertical_speed_range: Tuple[float, float] = (-1.0, 1.0)
+    regime_change_prob: float = 0.3
+    regime_change_speed_delta: float = 5.0
 
 
 class WindField:
-    """Generates time-varying wind vectors."""
+    """Generates time-varying wind vectors with optional regime changes."""
 
-    def __init__(self, config: WindConfig, rng: np.random.Generator):
+    def __init__(self, config: WindConfig, rng: np.random.Generator,
+                 total_steps: int = 0):
         self.cfg = config
         self.rng = rng
 
@@ -123,16 +126,41 @@ class WindField:
             wz
         ])
         self._current = self.base_wind.copy()
+        self._step_count = 0
+
+        self._regime_change_step = -1
+        self._new_base_wind = None
+        if (total_steps > 0
+                and config.regime_change_prob > 0
+                and rng.random() < config.regime_change_prob):
+            change_frac = rng.uniform(0.3, 0.7)
+            self._regime_change_step = int(total_steps * change_frac)
+            delta = config.regime_change_speed_delta
+            new_speed = max(0.0, speed + rng.uniform(-delta, delta))
+            new_dir = direction + rng.uniform(-np.pi / 2, np.pi / 2)
+            new_wz = rng.uniform(*config.vertical_speed_range)
+            self._new_base_wind = np.array([
+                new_speed * np.cos(new_dir),
+                new_speed * np.sin(new_dir),
+                new_wz,
+            ])
 
     def reset(self):
         self._current = self.base_wind.copy()
+        self._step_count = 0
 
     def step(self, dt: float) -> np.ndarray:
         """Advance one timestep. Returns (3,) wind vector."""
+        self._step_count += 1
+
+        if (self._regime_change_step > 0
+                and self._step_count == self._regime_change_step
+                and self._new_base_wind is not None):
+            self.base_wind = self._new_base_wind.copy()
+
         if self.cfg.mode == "constant":
             return self.base_wind.copy()
 
-        # AR(1): w_{t+1} = alpha * w_t + (1-alpha) * w_base + eps
         alpha = self.cfg.ar1_alpha
         eps = self.rng.normal(0, self.cfg.ar1_sigma, size=3)
         self._current = alpha * self._current + (1 - alpha) * self.base_wind + eps
@@ -142,12 +170,17 @@ class WindField:
         return self._current.copy()
 
     def get_meta(self) -> dict:
-        return {
+        meta = {
             "mode": self.cfg.mode,
             "base_wind": self.base_wind.tolist(),
             "ar1_alpha": self.cfg.ar1_alpha,
             "ar1_sigma": self.cfg.ar1_sigma,
         }
+        if self._regime_change_step > 0:
+            meta["regime_change_step"] = self._regime_change_step
+            if self._new_base_wind is not None:
+                meta["new_base_wind"] = self._new_base_wind.tolist()
+        return meta
 
 
 # ============================================================

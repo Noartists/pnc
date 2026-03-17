@@ -10,7 +10,9 @@ Usage:
 import os
 import sys
 import argparse
+import hashlib
 import yaml
+from datetime import datetime
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -30,6 +32,7 @@ def load_config_from_yaml(yaml_path: str, overrides: dict) -> TrainConfig:
     loss = cfg.get("loss", {})
 
     rollout = cfg.get("rollout", {})
+    aux = cfg.get("aux_loss", {})
 
     tc = TrainConfig(
         h5_path=data.get("h5_path", "learning/datasets/pilot.h5"),
@@ -47,6 +50,10 @@ def load_config_from_yaml(yaml_path: str, overrides: dict) -> TrainConfig:
         max_epochs=training.get("max_epochs", 100),
         warmup_steps=training.get("warmup_steps", 500),
         grad_clip=training.get("grad_clip", 1.0),
+        use_amp=training.get("use_amp", True),
+        num_workers=training.get("num_workers", 0),
+        preload_dataset=training.get("preload_dataset", True),
+        samples_per_traj=training.get("samples_per_traj", 10),
         curriculum_enabled=training.get("curriculum_enabled", True),
         curriculum_start_H=training.get("curriculum_start_H", 1),
         curriculum_epoch_per_step=training.get("curriculum_epoch_per_step", 5),
@@ -58,7 +65,27 @@ def load_config_from_yaml(yaml_path: str, overrides: dict) -> TrainConfig:
         rollout_weight=rollout.get("weight", 0.5),
         rollout_warmup_epochs=rollout.get("warmup_epochs", 10),
         rollout_steps=rollout.get("steps", 0),
+        aux_loss_enabled=aux.get("enabled", False),
+        aux_loss_weight=aux.get("weight", 0.1),
+        aux_predict_wind=aux.get("predict_wind", True),
+        aux_predict_params=aux.get("predict_params", False),
     )
+
+    exp_name = data.get("dataset_name", "pilot")
+
+    # Build unique run tag: <timestamp>_<config_hash>_<exp>
+    # e.g.  "20260316_143022_a7f3_pilot"
+    cfg_str = yaml.dump(cfg, sort_keys=True)
+    cfg_hash = hashlib.md5(cfg_str.encode()).hexdigest()[:4]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_tag = f"{ts}_{cfg_hash}_{exp_name}"
+
+    # Allow CLI --run-name to override the auto-generated tag
+    if overrides.get("run_name"):
+        run_tag = overrides["run_name"]
+
+    tc.checkpoint_dir = f"learning/checkpoints/{exp_name}/{run_tag}"
+    tc.tensorboard_log_dir = f"learning/runs/{exp_name}/{run_tag}"
 
     # CLI overrides
     if overrides.get("resume"):
@@ -68,7 +95,7 @@ def load_config_from_yaml(yaml_path: str, overrides: dict) -> TrainConfig:
     if overrides.get("wandb"):
         tc.use_wandb = True
     if overrides.get("run_name"):
-        tc.wandb_run_name = overrides["run_name"]
+        tc.wandb_run_name = run_tag
     if overrides.get("epochs"):
         tc.max_epochs = overrides["epochs"]
 

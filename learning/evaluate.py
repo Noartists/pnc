@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
+from tqdm import tqdm
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -25,7 +26,7 @@ if ROOT_DIR not in sys.path:
 from learning.model import InContextDynamicsTransformer, ModelConfig, MLPDynamicsModel
 from learning.dataset import (
     NormalizationStats, encode_state_token, encode_state_delta,
-    TOKEN_DIM, TARGET_DIM,
+    TOKEN_DIM, TARGET_DIM, WIND_LABEL_DIM, PARAM_LABEL_DIM,
 )
 from learning.data_generation.dataset_generator import (
     DatasetGenerator, GenerationConfig,
@@ -64,7 +65,7 @@ def make_ood_param_split(n: int = 200) -> EvalSplit:
     from learning.data_generation.domain_randomization import PARAM_PERTURBATION_SPEC
     ood_spec = {}
     for k, v in PARAM_PERTURBATION_SPEC.items():
-        ood_spec[k] = min(v * 1.8, 0.45)
+        ood_spec[k] = min(v * 1.5, 0.60)
 
     cfg = GenerationConfig(
         n_trajectories=n,
@@ -84,8 +85,9 @@ def make_ood_wind_split(n: int = 200) -> EvalSplit:
         traj_length_steps=2000,
         wind_config=WindConfig(
             mode="ar1",
-            speed_range=(5.0, 10.0),
-            ar1_sigma=0.6,
+            speed_range=(10.0, 15.0),
+            ar1_sigma=0.8,
+            regime_change_prob=0.0,
         ),
         save_subsample_step=EVAL_SUBSAMPLE_STEP,
     )
@@ -225,7 +227,7 @@ def evaluate_on_split(
         traj_grp = f["trajectories"]
         keys = sorted(traj_grp.keys())[:max_trajs]
 
-        for key in keys:
+        for key in tqdm(keys, desc=f"Eval rollouts", leave=False, unit="traj"):
             states = traj_grp[key]["states"][:]
             actions = traj_grp[key]["actions"][:]
             T = len(states)
@@ -280,14 +282,14 @@ def context_length_ablation(
         K_values = [5, 10, 20, 30, 50]
 
     results = {}
-    for K in K_values:
-        print(f"  Evaluating K={K}...")
+    for K in tqdm(K_values, desc="Context ablation", leave=False, unit="K"):
+        tqdm.write(f"  Evaluating K={K}...")
         result = evaluate_on_split(
             model, h5_path, norm, K, prediction_horizon,
             device, max_trajs=max_trajs, samples_per_traj=3,
         )
         results[K] = result
-        print(f"    RMSE: {result.rmse_total:.6f}")
+        tqdm.write(f"    RMSE: {result.rmse_total:.6f}")
 
     return results
 
@@ -451,7 +453,13 @@ def main():
         prediction_horizon=train_cfg.get("prediction_horizon", 20),
         proj_hidden=train_cfg.get("d_model", 128),
     )
-    model = InContextDynamicsTransformer(model_cfg).to(device)
+    aux_dim = 0
+    if train_cfg.get("aux_loss_enabled", False):
+        if train_cfg.get("aux_predict_wind", True):
+            aux_dim += WIND_LABEL_DIM
+        if train_cfg.get("aux_predict_params", False):
+            aux_dim += PARAM_LABEL_DIM
+    model = InContextDynamicsTransformer(model_cfg, aux_dim=aux_dim).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print(f"Model loaded: {model.count_parameters():,} params")

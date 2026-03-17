@@ -1,10 +1,10 @@
-# Pilot experiment: in-context adaptation validation
-# Generate: python -m learning.data_generation.dataset_generator --n-trajs 5000 --traj-length 2000 --subsample-step 10 --dataset-name pilot
-# Train:   python -m learning.train --config learning/configs/pilot.yaml --tensorboard
+# E4: Original small range, NO regime change, WITH aux loss
+# Data: python -m learning.data_generation.dataset_generator --n-trajs 5000 --traj-length 2000 --subsample-step 10 --dataset-name e4 --no-regime-change --wind-speed-max 5.0 --param-scale 0.6
+# Train: python -m learning.train --config learning/configs/ablation_e4.yaml --tensorboard
 
 data:
-  h5_path: learning/datasets/pilot.h5
-  dataset_name: pilot
+  h5_path: learning/datasets/e4.h5
+  dataset_name: e4
   n_trajectories: 5000
   traj_length_steps: 2000
   dt: 0.1
@@ -26,7 +26,7 @@ training:
   warmup_steps: 200
   grad_clip: 1.0
   use_amp: true
-  preload_dataset: true   # 整份 train/val 轨迹进内存，训练更快；内存不够改为 false
+  preload_dataset: true   # train/val 进内存加速；内存不够改 false
   curriculum_enabled: true
   curriculum_start_H: 1
   curriculum_epoch_per_step: 3

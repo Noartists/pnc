@@ -25,6 +25,7 @@ training:
   max_epochs: 200
   warmup_steps: 1000
   grad_clip: 1.0
+  preload_dataset: false   # 5万条约数十 GB RAM；内存够可改 true（与 pilot 一致加速）
   curriculum_enabled: true
   curriculum_start_H: 1
   curriculum_epoch_per_step: 10
@@ -40,3 +41,9 @@ rollout:
   weight: 0.5
   warmup_epochs: 20
   steps: 0
+
+aux_loss:
+  enabled: true
+  weight: 0.1
+  predict_wind: true
+  predict_params: false

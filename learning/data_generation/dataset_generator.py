@@ -19,8 +19,10 @@ import numpy as np
 import h5py
 from dataclasses import dataclass, field, asdict
 from typing import Tuple, Optional, List, Dict
-from multiprocessing import Pool, cpu_count, freeze_support
+from multiprocessing import cpu_count, freeze_support
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
+from tqdm import tqdm
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT_DIR not in sys.path:
@@ -120,7 +122,7 @@ def generate_single_trajectory(
         multipliers = {}
 
     # --- Wind ---
-    wind = WindField(cfg.wind_config, rng)
+    wind = WindField(cfg.wind_config, rng, total_steps=cfg.traj_length_steps)
 
     # --- Actuator ---
     actuator = ActuatorModel(cfg.actuator_config, cfg.control_dt, rng)
@@ -307,21 +309,14 @@ class DatasetGenerator:
         cfg = self.cfg
         n = cfg.n_trajectories
 
-        # On Windows, force single-process to avoid spawn-related hangs.
-        # Use --n-workers 1 or rely on this default.
-        if sys.platform == "win32" and cfg.n_workers != 1:
+        if cfg.n_workers == 1:
             n_workers = 1
-            print("Note: Windows detected, using single-process mode "
-                  "(multiprocessing.Pool can hang on Windows with spawn).")
-            print("  For parallel generation, consider running on Linux or WSL.")
         else:
-            n_workers = cfg.n_workers or max(1, cpu_count() - 1)
+            n_workers = cfg.n_workers or max(1, min(cpu_count() // 3, 6))
 
-        # Reproducible seeds
         ss = np.random.SeedSequence(base_seed)
         seeds = [int(s.generate_state(1)[0]) for s in ss.spawn(n)]
 
-        # Prepare serializable config dict
         cfg_dict = _config_to_dict(cfg)
 
         print(f"Generating {n} trajectories with {n_workers} workers...")
@@ -330,8 +325,8 @@ class DatasetGenerator:
         if cfg.save_subsample_step > 1:
             eff_dt = cfg.control_dt * cfg.save_subsample_step
             eff_steps = cfg.traj_length_steps // cfg.save_subsample_step
-            print(f"  Subsample: every {cfg.save_subsample_step} steps → "
-                  f"effective dt={eff_dt}s, ~{eff_steps} saved steps/traj")
+            print(f"  Subsample: every {cfg.save_subsample_step} steps "
+                  f"-> effective dt={eff_dt}s, ~{eff_steps} saved steps/traj")
         print(f"  Domain randomization: {cfg.randomize_params}")
 
         args_list = [
@@ -342,27 +337,34 @@ class DatasetGenerator:
 
         if n_workers <= 1:
             results = []
-            for i, args in enumerate(args_list):
+            pbar = tqdm(args_list, desc="Generating trajectories",
+                        unit="traj")
+            for args in pbar:
                 r = _worker(args)
                 results.append(r)
-                if (i + 1) % max(1, n // 10) == 0 or i == n - 1:
-                    elapsed = time.time() - t0
-                    rate = (i + 1) / elapsed
-                    eta = (n - i - 1) / rate if rate > 0 else 0
-                    print(f"  [{i+1}/{n}] {rate:.1f} traj/s, "
-                          f"elapsed={elapsed:.1f}s, ETA={eta:.0f}s")
+                status = "OK" if (r is not None and r["success"]) else "FAIL"
+                pbar.set_postfix(status=status)
         else:
-            results = []
-            with Pool(n_workers) as pool:
-                for i, r in enumerate(pool.imap_unordered(_worker, args_list,
-                                                          chunksize=10)):
-                    results.append(r)
-                    if (i + 1) % max(1, n // 10) == 0 or i == n - 1:
-                        elapsed = time.time() - t0
-                        rate = (i + 1) / elapsed
-                        eta = (n - i - 1) / rate if rate > 0 else 0
-                        print(f"  [{i+1}/{n}] {rate:.1f} traj/s, "
-                              f"elapsed={elapsed:.1f}s, ETA={eta:.0f}s")
+            results = [None] * n
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                future_to_idx = {}
+                for idx, args in enumerate(args_list):
+                    f = executor.submit(_worker, args)
+                    future_to_idx[f] = idx
+
+                pbar = tqdm(as_completed(future_to_idx),
+                            total=n, desc="Generating trajectories",
+                            unit="traj")
+                for future in pbar:
+                    idx = future_to_idx[future]
+                    try:
+                        r = future.result()
+                    except Exception as e:
+                        r = None
+                        tqdm.write(f"Worker {idx} error: {e}")
+                    results[idx] = r
+                    status = "OK" if (r is not None and r["success"]) else "FAIL"
+                    pbar.set_postfix(status=status)
 
         elapsed = time.time() - t0
         print(f"\nGeneration done in {elapsed:.1f}s")
@@ -409,7 +411,9 @@ class DatasetGenerator:
             config_grp.attrs["action_dim"] = 2
 
             traj_grp = f.create_group("trajectories")
-            for i, r in enumerate(valid_results):
+            for i, r in tqdm(enumerate(valid_results),
+                             total=len(valid_results),
+                             desc="Saving to HDF5", unit="traj"):
                 states = r["states"][::ss]
                 observed = r["observed_states"][::ss]
                 actions = r["actions"][::ss]
@@ -500,9 +504,26 @@ def main():
     parser.add_argument("--no-sensor-noise", action="store_true",
                         help="Disable sensor noise")
     parser.add_argument("--subsample-step", type=int, default=1,
-                        help="Downsample factor when saving (10 → dt_eff=0.1s)")
+                        help="Downsample factor when saving (10 -> dt_eff=0.1s)")
+    parser.add_argument("--no-regime-change", action="store_true",
+                        help="Disable mid-trajectory wind regime changes")
+    parser.add_argument("--wind-speed-max", type=float, default=None,
+                        help="Override max wind speed (m/s)")
+    parser.add_argument("--param-scale", type=float, default=1.0,
+                        help="Scale factor for param perturbation ranges")
 
     args = parser.parse_args()
+
+    wind_cfg = WindConfig(mode=args.wind_mode)
+    if args.no_regime_change:
+        wind_cfg.regime_change_prob = 0.0
+    if args.wind_speed_max is not None:
+        wind_cfg.speed_range = (0.0, args.wind_speed_max)
+
+    param_spec = None
+    if args.param_scale != 1.0:
+        from learning.data_generation.domain_randomization import PARAM_PERTURBATION_SPEC
+        param_spec = {k: v * args.param_scale for k, v in PARAM_PERTURBATION_SPEC.items()}
 
     cfg = GenerationConfig(
         n_trajectories=args.n_trajectories,
@@ -512,7 +533,8 @@ def main():
         output_dir=args.output_dir,
         n_workers=args.n_workers,
         randomize_params=not args.no_randomize,
-        wind_config=WindConfig(mode=args.wind_mode),
+        wind_config=wind_cfg,
+        param_perturbation_spec=param_spec,
         sensor_noise_config=SensorNoiseConfig(enabled=not args.no_sensor_noise),
         save_subsample_step=args.subsample_step,
     )
