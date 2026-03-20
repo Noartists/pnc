@@ -64,7 +64,10 @@ class KinodynamicRRTStar:
         # 经验值约 5.0（基于 ~67% 饱和率下的加权平均），
         # 对比理论中点 4.48 更保守，确保路径长度充足
         self.effective_min_glide = 5.0
+        self.trackable_glide_budget = min(self.max_glide * 0.96, self.max_glide - 0.12)
         self.min_altitude = map_manager.constraints.min_altitude
+        self.goal_xy_tolerance = 5.0
+        self.goal_heading_tolerance = np.radians(45.0)
         
         # Dubins曲线计算器
         self.dubins = DubinsPath(self.min_turn_radius)
@@ -118,6 +121,7 @@ class KinodynamicRRTStar:
         # 存储目标信息供 _steer 使用
         self._goal_xy = goal[:2].copy()
         self._goal_z = goal[2]
+        self._max_total_length = max(v_dist * self.max_glide, 1.0)
 
         # 初始化
         start_state = KinoState(start[0], start[1], start[2], start_heading)
@@ -236,6 +240,13 @@ class KinodynamicRRTStar:
 
             stats['added'] += 1
 
+            if not self._can_reach_goal_with_budget(new_state, best_parent_cost, goal_state):
+                self.nodes.pop()
+                self.edge_paths.pop((best_parent_idx, new_idx), None)
+                stats['added'] -= 1
+                pbar.update(1)
+                continue
+
             # --- RRT* rewire (仅在找到路径后且时间充裕时) ---
             if goal_reached and elapsed < 25.0 and n_nodes < 1500:
                 rewire_radius = min(self.step_size * 2, 300.0)
@@ -248,7 +259,14 @@ class KinodynamicRRTStar:
                     if rw_steer is None:
                         continue
                     rw_state, rw_path = rw_steer
-                    if np.linalg.norm(rw_state.position - n_node.state.position) > 30.0:
+                    pos_gap = np.linalg.norm(rw_state.position - n_node.state.position)
+                    heading_gap = abs(
+                        self._normalize_angle(rw_state.heading - n_node.state.heading)
+                    )
+                    # Rewire only when the steered endpoint essentially matches the
+                    # existing node state; otherwise the parent changes but the stored
+                    # subtree geometry becomes inconsistent and extracted paths can fold back.
+                    if pos_gap > 1.0 or heading_gap > np.radians(10.0):
                         continue
                     if not self._is_feasible(new_state, rw_state, goal_z=goal[2]):
                         continue
@@ -259,6 +277,7 @@ class KinodynamicRRTStar:
                     rw_cost = best_parent_cost + rw_len
                     if rw_cost < n_node.cost:
                         old_parent = n_node.parent
+                        n_node.state = rw_state
                         n_node.parent = new_idx
                         n_node.cost = rw_cost
                         if old_parent is not None:
@@ -269,32 +288,19 @@ class KinodynamicRRTStar:
             dist_to_goal = np.linalg.norm(new_state.position[:2] - goal_state.position[:2])
             dz_to_goal = abs(new_state.z - goal_state.z)
 
-            if dist_to_goal < 300 and dz_to_goal < 200:
-                # 尝试用Dubins/直线连接到精确目标点
-                connected = False
-                goal_steer = self._steer(new_state, goal_state)
-                if goal_steer is not None:
-                    g_state, g_path = goal_steer
-                    g_dist = np.linalg.norm(g_state.position[:2] - goal_state.position[:2])
-                    if g_dist < 80 and not self._has_collision_path(g_path):
-                        g_len = sum(np.linalg.norm(g_path[j+1] - g_path[j])
-                                    for j in range(len(g_path)-1))
-                        g_cost = best_parent_cost + g_len
-                        g_node = KinoNode(g_state, new_idx, g_cost)
-                        g_idx = len(self.nodes)
-                        self.nodes.append(g_node)
-                        self.edge_paths[(new_idx, g_idx)] = g_path
-                        if g_cost < best_cost:
-                            best_cost = g_cost
-                            best_idx = g_idx
-                            goal_reached = True
-                            connected = True
-
-                # 即使直连没成功，只要足够近也算到达
-                if not connected and best_parent_cost < best_cost:
-                    best_cost = best_parent_cost
-                    best_idx = new_idx
-                    goal_reached = True
+            if dist_to_goal < 320 and dz_to_goal < 240:
+                goal_connection = self._try_goal_connection(new_state, goal_state)
+                if goal_connection is not None:
+                    g_state, g_path, g_len = goal_connection
+                    g_cost = best_parent_cost + g_len
+                    g_node = KinoNode(g_state, new_idx, g_cost)
+                    g_idx = len(self.nodes)
+                    self.nodes.append(g_node)
+                    self.edge_paths[(new_idx, g_idx)] = g_path
+                    if g_cost < best_cost:
+                        best_cost = g_cost
+                        best_idx = g_idx
+                        goal_reached = True
 
             pbar.update(1)
             pbar.set_postfix_str(f"节点:{len(self.nodes)}, 距目标:{dist_to_goal:.0f}m")
@@ -314,29 +320,23 @@ class KinodynamicRRTStar:
                 if d2d > 500:
                     break
                 n_node = self.nodes[ni]
-                gs = self._steer(n_node.state, goal_state)
-                if gs is None:
+                goal_connection = self._try_goal_connection(n_node.state, goal_state)
+                if goal_connection is None:
                     continue
-                gs_state, gs_path = gs
-                gs_dist = np.linalg.norm(
-                    gs_state.position[:2] - goal_state.position[:2])
-                if gs_dist < 100 and not self._has_collision_path(gs_path):
-                    gs_len = sum(
-                        np.linalg.norm(gs_path[j+1] - gs_path[j])
-                        for j in range(len(gs_path)-1))
-                    gs_cost = n_node.cost + gs_len
-                    gs_node = KinoNode(gs_state, ni, gs_cost)
-                    gs_idx = len(self.nodes)
-                    self.nodes.append(gs_node)
-                    self.edge_paths[(ni, gs_idx)] = gs_path
-                    if gs_cost < best_cost:
-                        best_cost = gs_cost
-                        best_idx = gs_idx
-                        goal_reached = True
-                        if not self.quiet:
-                            print(f"  [最终连接] 从节点{ni}成功, "
-                                  f"2D距离={d2d:.0f}m")
-                        break
+                gs_state, gs_path, gs_len = goal_connection
+                gs_cost = n_node.cost + gs_len
+                gs_node = KinoNode(gs_state, ni, gs_cost)
+                gs_idx = len(self.nodes)
+                self.nodes.append(gs_node)
+                self.edge_paths[(ni, gs_idx)] = gs_path
+                if gs_cost < best_cost:
+                    best_cost = gs_cost
+                    best_idx = gs_idx
+                    goal_reached = True
+                    if not self.quiet:
+                        print(f"  [最终连接] 从节点{ni}成功, "
+                              f"2D距离={d2d:.0f}m")
+                    break
 
         # 打印统计
         if not self.quiet:
@@ -365,7 +365,10 @@ class KinodynamicRRTStar:
 
         # 提取路径（此时高度是 _steer 中用名义滑翔比粗算的，需要重分配）
         path = self._extract_path(best_idx)
-        path.append(goal)  # 添加终点
+        if np.linalg.norm(path[-1][:2] - goal[:2]) > self.goal_xy_tolerance:
+            if not self.quiet:
+                print("  [失败] 终端路径未精确接到目标点")
+            return None, {'success': False, 'stats': stats}
 
         # 提取节点链（供后处理器使用）
         node_chain = self._extract_node_chain(best_idx)
@@ -376,6 +379,14 @@ class KinodynamicRRTStar:
         path, actual_glide = self._reassign_altitude(
             path, z_start, z_goal, goal_state.heading
         )
+        if path is None:
+            if not self.quiet:
+                print(f"  [失败] 路径总长度超出可用高度预算, required_glide={actual_glide:.2f}")
+            return None, {
+                'success': False,
+                'stats': stats,
+                'required_glide': actual_glide,
+            }
 
         if not self.quiet:
             print(f"  [成功] 路径点数: {len(path)}, 实际滑翔比: {actual_glide:.2f}")
@@ -484,7 +495,11 @@ class KinodynamicRRTStar:
         neighbors.sort(key=lambda x: x[1])
         return [idx for idx, _ in neighbors[:15]]
 
-    def _steer(self, from_s: KinoState, to_s: KinoState) -> Optional[Tuple[KinoState, List[np.ndarray]]]:
+    def _steer(self,
+               from_s: KinoState,
+               to_s: KinoState,
+               max_distance: Optional[float] = None,
+               force_goal_heading: bool = False) -> Optional[Tuple[KinoState, List[np.ndarray]]]:
         """
         使用Dubins曲线（或直线）扩展。
 
@@ -501,9 +516,11 @@ class KinodynamicRRTStar:
         if dist_2d < 10.0:
             return None
 
+        step_limit = self.step_size if max_distance is None else max_distance
+
         # 截断到 step_size
-        if dist_2d > self.step_size:
-            ratio = self.step_size / dist_2d
+        if dist_2d > step_limit:
+            ratio = step_limit / dist_2d
             target_x = from_s.x + dx * ratio
             target_y = from_s.y + dy * ratio
             target_heading = np.arctan2(dy, dx)
@@ -516,10 +533,22 @@ class KinodynamicRRTStar:
         heading_to_target = np.arctan2(target_y - from_s.y, target_x - from_s.x)
         heading_diff = abs(self._normalize_angle(from_s.heading - heading_to_target))
 
-        if heading_diff < 0.25:  # ~14度，几乎同向，直线更高效
+        prefer_straight = heading_diff < 0.25  # ~14度，几乎同向，直线更高效
+        if force_goal_heading and dist_2d <= step_limit:
+            goal_heading_gap = abs(self._normalize_angle(to_s.heading - heading_to_target))
+            prefer_straight = prefer_straight and goal_heading_gap < np.radians(20.0)
+
+        if prefer_straight:
             new_heading = heading_to_target
-            path_2d = [np.array([from_s.x, from_s.y]), np.array([target_x, target_y])]
             path_len = np.sqrt((target_x - from_s.x)**2 + (target_y - from_s.y)**2)
+            sample_spacing = max(3.0, min(5.0, self.min_turn_radius / 30.0))
+            n_pts = int(np.clip(np.ceil(path_len / sample_spacing) + 1, 2, 400))
+            start_xy = np.array([from_s.x, from_s.y], dtype=np.float64)
+            end_xy = np.array([target_x, target_y], dtype=np.float64)
+            path_2d = [
+                start_xy + (i / max(n_pts - 1, 1)) * (end_xy - start_xy)
+                for i in range(n_pts)
+            ]
         else:
             # 计算Dubins曲线
             dubins_path = self.dubins.compute(
@@ -529,23 +558,26 @@ class KinodynamicRRTStar:
 
             if dubins_path is None:
                 new_heading = heading_to_target
-                path_2d = [np.array([from_s.x, from_s.y]), np.array([target_x, target_y])]
                 path_len = np.sqrt((target_x - from_s.x)**2 + (target_y - from_s.y)**2)
+                sample_spacing = max(3.0, min(5.0, self.min_turn_radius / 30.0))
+                n_pts = int(np.clip(np.ceil(path_len / sample_spacing) + 1, 2, 400))
+                start_xy = np.array([from_s.x, from_s.y], dtype=np.float64)
+                end_xy = np.array([target_x, target_y], dtype=np.float64)
+                path_2d = [
+                    start_xy + (i / max(n_pts - 1, 1)) * (end_xy - start_xy)
+                    for i in range(n_pts)
+                ]
             else:
                 # [调参] 按弧长自适应采样，间距约20m，避免长/短弧密度差异导致曲率噪声
-                n_pts = int(np.clip(dubins_path['length'] / 20.0, 4, 80))
+                sample_spacing = max(3.0, min(5.0, self.min_turn_radius / 30.0))
+                n_pts = int(np.clip(np.ceil(dubins_path['length'] / sample_spacing) + 1, 6, 400))
                 path_2d = self.dubins.sample(dubins_path, num_points=n_pts)
                 path_len = dubins_path['length']
 
                 if len(path_2d) < 2:
                     return None
 
-                last_dx = path_2d[-1][0] - path_2d[-2][0]
-                last_dy = path_2d[-1][1] - path_2d[-2][1]
-                if abs(last_dx) > 1e-6 or abs(last_dy) > 1e-6:
-                    new_heading = np.arctan2(last_dy, last_dx)
-                else:
-                    new_heading = target_heading
+                new_heading = self.dubins.end_heading(dubins_path)
 
         # --- 自适应下降率：根据当前节点到目标的剩余距离动态调整 ---
         end_pt = path_2d[-1]
@@ -582,6 +614,72 @@ class KinodynamicRRTStar:
 
         new_state = KinoState(new_x, new_y, new_z, new_heading)
         return new_state, path_3d
+
+    def _can_reach_goal_with_budget(self,
+                                    state: KinoState,
+                                    cost_so_far: float,
+                                    goal_state: KinoState) -> bool:
+        """Prune nodes that are already physically unable to reach the target."""
+        remaining_altitude = state.z - goal_state.z
+        if remaining_altitude <= 1.0:
+            return False
+
+        remaining_2d = np.linalg.norm(state.position[:2] - goal_state.position[:2])
+        if remaining_2d > remaining_altitude * self.max_glide * 1.02:
+            return False
+
+        optimistic_total = cost_so_far + remaining_2d
+        if optimistic_total > self._max_total_length * 1.02:
+            return False
+
+        return True
+
+    def _try_goal_connection(self,
+                             from_state: KinoState,
+                             goal_state: KinoState) -> Optional[Tuple[KinoState, List[np.ndarray], float]]:
+        """Attempt an exact terminal connection to the goal using several heading options."""
+        direct_heading = np.arctan2(goal_state.y - from_state.y, goal_state.x - from_state.x)
+        goal_options = [
+            KinoState(goal_state.x, goal_state.y, goal_state.z, goal_state.heading),
+        ]
+        if abs(self._normalize_angle(direct_heading - goal_state.heading)) > np.radians(8.0):
+            goal_options.append(
+                KinoState(goal_state.x, goal_state.y, goal_state.z, direct_heading)
+            )
+
+        best_connection = None
+        best_score = float('inf')
+
+        for candidate_goal in goal_options:
+            steer_result = self._steer(
+                from_state,
+                candidate_goal,
+                max_distance=float('inf'),
+                force_goal_heading=(candidate_goal.heading == goal_state.heading),
+            )
+            if steer_result is None:
+                continue
+
+            end_state, path_3d = steer_result
+            pos_error = np.linalg.norm(end_state.position[:2] - goal_state.position[:2])
+            if pos_error > self.goal_xy_tolerance:
+                continue
+            if not self._is_feasible(from_state, end_state, goal_z=goal_state.z):
+                continue
+            if self._has_collision_path(path_3d):
+                continue
+
+            path_len = sum(
+                np.linalg.norm(path_3d[j + 1] - path_3d[j])
+                for j in range(len(path_3d) - 1)
+            )
+            heading_error = abs(self._normalize_angle(end_state.heading - goal_state.heading))
+            score = path_len + 5.0 * pos_error + self.min_turn_radius * heading_error
+            if score < best_score:
+                best_score = score
+                best_connection = (end_state, path_3d, path_len)
+
+        return best_connection
     
     def _is_feasible(self, from_s: KinoState, to_s: KinoState, goal_z: float = 0.0) -> bool:
         """
@@ -603,8 +701,19 @@ class KinodynamicRRTStar:
     
     def _has_collision_path(self, path_3d: List[np.ndarray]) -> bool:
         """检测路径上的碰撞"""
+        if len(path_3d) == 0:
+            return False
+
         for pt in path_3d:
             if self.map.is_collision(pt):
+                return True
+
+        for i in range(len(path_3d) - 1):
+            p0 = path_3d[i]
+            p1 = path_3d[i + 1]
+            seg_len = np.linalg.norm(p1 - p0)
+            n_samples = max(2, int(np.ceil(seg_len / 5.0)) + 1)
+            if self.map.is_path_collision(p0, p1, n_samples=n_samples):
                 return True
         return False
     
@@ -637,9 +746,9 @@ class KinodynamicRRTStar:
                 edge_path = self.edge_paths[edge_key]
                 # 除了最后一条边，不添加最后一个点（避免重复）
                 if i < len(indices) - 2:
-                    path.extend(edge_path[:-1])
+                    path.extend([pt.copy() for pt in edge_path[:-1]])
                 else:
-                    path.extend(edge_path)
+                    path.extend([pt.copy() for pt in edge_path])
             else:
                 # 没有存储的路径，直接用节点位置
                 path.append(self.nodes[parent_idx].state.position.copy())
@@ -775,7 +884,7 @@ class KinodynamicRRTStar:
 
     def _reassign_altitude(self, path: List[np.ndarray],
                            z_start: float, z_goal: float,
-                           goal_heading: float) -> Tuple[List[np.ndarray], float]:
+                           goal_heading: float) -> Tuple[Optional[List[np.ndarray]], float]:
         """
         基于实际 2D 路径长度，重新分配高度剖面（线性分配）。
 
@@ -804,6 +913,9 @@ class KinodynamicRRTStar:
             print(f"  [高度重分配] 2D路径长={total_len_2d:.0f}m, "
                   f"高度差={delta_z:.0f}m, 所需滑翔比={required_glide:.2f}, "
                   f"有效最小滑翔比={self.effective_min_glide:.2f}")
+
+        if required_glide > self.max_glide * 1.001:
+            return None, required_glide
 
         # 线性分配高度（按 2D 距离比例）
         cum_dist = 0.0

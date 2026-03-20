@@ -36,6 +36,7 @@ class FailureThresholds:
     """失败判定阈值配置"""
     # 成功判定
     landing_radius: float = 20.0             # 落点误差阈值 (m)
+    landing_altitude: float = 20.0           # 终端高度阈值 (m)
     
     # H1: 约束违规
     safety_margin: float = 15.0              # 安全间距阈值 (m)
@@ -221,11 +222,13 @@ class FailureDetector:
         if self.target_position is None:
             return False
         
-        # 计算落点误差（水平距离）
+        # 计算落点误差（水平距离 + 终端高度）
         error = np.linalg.norm(final_position[:2] - self.target_position[:2])
+        vertical_error = abs(final_position[2] - self.target_position[2])
         
-        # 检查是否在目标区域内且无失败
+        # 检查是否在目标区域内且已足够接近地面，同时无失败
         return (error <= self.thresholds.landing_radius and 
+                vertical_error <= self.thresholds.landing_altitude and
                 not self.hard_fail_detected and 
                 not self.soft_fail_detected)
     

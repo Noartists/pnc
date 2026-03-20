@@ -16,6 +16,10 @@ from control.adrc_controller import (
     ParafoilADRCController,
     ControlOutput
 )
+from control.pid_controller import (
+    HeadingPID,
+    ParafoilPIDController,
+)
 
 __all__ = [
     'ADRC',
@@ -25,5 +29,7 @@ __all__ = [
     'NLSEF',
     'LinearSEF',
     'ParafoilADRCController',
+    'HeadingPID',
+    'ParafoilPIDController',
     'ControlOutput'
 ]

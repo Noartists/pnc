@@ -44,27 +44,34 @@ class DubinsPath:
             return None
 
         theta = np.arctan2(dy, dx)
-        alpha = self._normalize_angle(h0 - theta)
-        beta = self._normalize_angle(h1 - theta)
+        alpha = self._mod2pi(h0 - theta)
+        beta = self._mod2pi(h1 - theta)
 
-        # 尝试所有6种Dubins路径类型
-        paths = [
+        # Prefer classic CSC paths for trackability; fall back to CCC only when needed.
+        csc_paths = [
             self._LSL(alpha, beta, d),
             self._RSR(alpha, beta, d),
             self._LSR(alpha, beta, d),
             self._RSL(alpha, beta, d),
+        ]
+        ccc_paths = [
             self._LRL(alpha, beta, d),
             self._RLR(alpha, beta, d),
         ]
 
-        # 选择最短的有效路径
         best = None
         best_len = float('inf')
 
-        for path in paths:
+        for path in csc_paths:
             if path is not None and path['length'] < best_len:
                 best = path
                 best_len = path['length']
+
+        if best is None:
+            for path in ccc_paths:
+                if path is not None and path['length'] < best_len:
+                    best = path
+                    best_len = path['length']
 
         if best is None:
             return None
@@ -94,8 +101,10 @@ class DubinsPath:
         points = []
         x, y, h = x0, y0, h0
 
-        total_len = sum(s[0] for s in segments)
-        step = total_len / (num_points - 1) if num_points > 1 else total_len
+        total_len = path.get('length', sum(seg_len * r for seg_len, _ in segments))
+        if num_points <= 1:
+            return [np.array([x0, y0], dtype=np.float64)]
+        step = total_len / (num_points - 1)
 
         accumulated = 0.0
         seg_idx = 0
@@ -105,7 +114,10 @@ class DubinsPath:
             target_dist = i * step
 
             # 前进到目标距离
-            while accumulated + (segments[seg_idx][0] * r - seg_progress) < target_dist and seg_idx < len(segments) - 1:
+            while (
+                seg_idx < len(segments) - 1 and
+                accumulated + (segments[seg_idx][0] * r - seg_progress) < target_dist
+            ):
                 # 完成当前段
                 seg_len, direction = segments[seg_idx]
                 remaining = seg_len * r - seg_progress
@@ -135,7 +147,8 @@ class DubinsPath:
             # 在当前段内前进
             if seg_idx < len(segments):
                 seg_len, direction = segments[seg_idx]
-                advance = target_dist - accumulated
+                max_advance = max(seg_len * r - seg_progress, 0.0)
+                advance = np.clip(target_dist - accumulated, 0.0, max_advance)
 
                 if direction == 'S':
                     px = x + advance * np.cos(h)
@@ -156,6 +169,11 @@ class DubinsPath:
                 points.append(np.array([px, py]))
             else:
                 points.append(np.array([x, y]))
+
+        if points:
+            points[0] = np.array([x0, y0], dtype=np.float64)
+            x1, y1, _ = path['end']
+            points[-1] = np.array([x1, y1], dtype=np.float64)
 
         return points
 
@@ -215,24 +233,21 @@ class DubinsPath:
             angle += 2 * np.pi
         return angle
 
+    def _mod2pi(self, angle: float) -> float:
+        """Wrap angle to [0, 2*pi)."""
+        return angle % (2 * np.pi)
+
     def _LSL(self, alpha: float, beta: float, d: float) -> Optional[dict]:
         """Left-Straight-Left"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-
-        tmp = 2 + d**2 - 2*(ca*cb + sa*sb - d*(sa - sb))
-        if tmp < 0:
+        tmp0 = d + np.sin(alpha) - np.sin(beta)
+        tmp = 2 + d**2 - 2 * np.cos(alpha - beta) + 2 * d * (np.sin(alpha) - np.sin(beta))
+        if tmp < 0.0:
             return None
 
         p = np.sqrt(tmp)
-        theta = np.arctan2(cb - ca, d + sa - sb)
-        t = self._normalize_angle(-alpha + theta)
-        q = self._normalize_angle(beta - theta)
-
-        if t < -1e-6 or q < -1e-6:
-            return None
-        t = max(t, 0.0)
-        q = max(q, 0.0)
+        theta = np.arctan2(np.cos(beta) - np.cos(alpha), tmp0)
+        t = self._mod2pi(-alpha + theta)
+        q = self._mod2pi(beta - theta)
 
         return {
             'type': 'LSL',
@@ -242,22 +257,15 @@ class DubinsPath:
 
     def _RSR(self, alpha: float, beta: float, d: float) -> Optional[dict]:
         """Right-Straight-Right"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-
-        tmp = 2 + d**2 - 2*(ca*cb + sa*sb - d*(sb - sa))
-        if tmp < 0:
+        tmp0 = d - np.sin(alpha) + np.sin(beta)
+        tmp = 2 + d**2 - 2 * np.cos(alpha - beta) + 2 * d * (np.sin(beta) - np.sin(alpha))
+        if tmp < 0.0:
             return None
 
         p = np.sqrt(tmp)
-        theta = np.arctan2(ca - cb, d - sa + sb)
-        t = self._normalize_angle(alpha - theta)
-        q = self._normalize_angle(-beta + theta)
-
-        if t < -1e-6 or q < -1e-6:
-            return None
-        t = max(t, 0.0)
-        q = max(q, 0.0)
+        theta = np.arctan2(np.cos(alpha) - np.cos(beta), tmp0)
+        t = self._mod2pi(alpha - theta)
+        q = self._mod2pi(-beta + theta)
 
         return {
             'type': 'RSR',
@@ -267,22 +275,15 @@ class DubinsPath:
 
     def _LSR(self, alpha: float, beta: float, d: float) -> Optional[dict]:
         """Left-Straight-Right"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-
-        tmp = -2 + d**2 + 2*(ca*cb + sa*sb + d*(sa + sb))
-        if tmp < 0:
+        tmp = -2 + d**2 + 2 * np.cos(alpha - beta) + 2 * d * (np.sin(alpha) + np.sin(beta))
+        if tmp < 0.0:
             return None
 
         p = np.sqrt(tmp)
-        theta = np.arctan2(-ca - cb, d + sa + sb) - np.arctan2(-2, p)
-        t = self._normalize_angle(-alpha + theta)
-        q = self._normalize_angle(-beta + theta)
-
-        if t < -1e-6 or q < -1e-6:
-            return None
-        t = max(t, 0.0)
-        q = max(q, 0.0)
+        theta = np.arctan2(-np.cos(alpha) - np.cos(beta), d + np.sin(alpha) + np.sin(beta))
+        theta -= np.arctan2(-2.0, p)
+        t = self._mod2pi(-alpha + theta)
+        q = self._mod2pi(-beta + theta)
 
         return {
             'type': 'LSR',
@@ -292,22 +293,15 @@ class DubinsPath:
 
     def _RSL(self, alpha: float, beta: float, d: float) -> Optional[dict]:
         """Right-Straight-Left"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-
-        tmp = -2 + d**2 + 2*(ca*cb + sa*sb - d*(sa + sb))
-        if tmp < 0:
+        tmp = -2 + d**2 + 2 * np.cos(alpha - beta) - 2 * d * (np.sin(alpha) + np.sin(beta))
+        if tmp < 0.0:
             return None
 
         p = np.sqrt(tmp)
-        theta = np.arctan2(ca + cb, d - sa - sb) - np.arctan2(2, p)
-        t = self._normalize_angle(alpha - theta)
-        q = self._normalize_angle(beta - theta)
-
-        if t < -1e-6 or q < -1e-6:
-            return None
-        t = max(t, 0.0)
-        q = max(q, 0.0)
+        theta = np.arctan2(np.cos(alpha) + np.cos(beta), d - np.sin(alpha) - np.sin(beta))
+        theta -= np.arctan2(2.0, p)
+        t = self._mod2pi(alpha - theta)
+        q = self._mod2pi(beta - theta)
 
         return {
             'type': 'RSL',
@@ -317,22 +311,14 @@ class DubinsPath:
 
     def _LRL(self, alpha: float, beta: float, d: float) -> Optional[dict]:
         """Left-Right-Left"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-
-        tmp = (6 - d**2 + 2*(ca*cb + sa*sb + d*(sa - sb))) / 8
-        if abs(tmp) > 1:
+        tmp = (6 - d**2 + 2 * np.cos(alpha - beta) + 2 * d * (-np.sin(alpha) + np.sin(beta))) / 8
+        if abs(tmp) > 1.0:
             return None
 
-        p = np.arccos(tmp)
-        theta = np.arctan2(ca - cb, d + sa - sb)
-        t = self._normalize_angle(-alpha + theta + p/2)
-        q = self._normalize_angle(beta - theta + p/2)
-
-        if t < -1e-6 or q < -1e-6:
-            return None
-        t = max(t, 0.0)
-        q = max(q, 0.0)
+        p = self._mod2pi(2 * np.pi - np.arccos(tmp))
+        theta = np.arctan2(np.cos(alpha) - np.cos(beta), d + np.sin(alpha) - np.sin(beta))
+        t = self._mod2pi(-alpha - theta + p / 2.0)
+        q = self._mod2pi(beta - alpha - t + p)
 
         return {
             'type': 'LRL',
@@ -342,25 +328,73 @@ class DubinsPath:
 
     def _RLR(self, alpha: float, beta: float, d: float) -> Optional[dict]:
         """Right-Left-Right"""
-        ca, sa = np.cos(alpha), np.sin(alpha)
-        cb, sb = np.cos(beta), np.sin(beta)
-
-        tmp = (6 - d**2 + 2*(ca*cb + sa*sb - d*(sa - sb))) / 8
-        if abs(tmp) > 1:
+        tmp = (6 - d**2 + 2 * np.cos(alpha - beta) + 2 * d * (np.sin(alpha) - np.sin(beta))) / 8
+        if abs(tmp) > 1.0:
             return None
 
-        p = np.arccos(tmp)
-        theta = np.arctan2(ca - cb, d - sa + sb)
-        t = self._normalize_angle(alpha - theta + p/2)
-        q = self._normalize_angle(-beta + theta + p/2)
-
-        if t < -1e-6 or q < -1e-6:
-            return None
-        t = max(t, 0.0)
-        q = max(q, 0.0)
+        p = self._mod2pi(2 * np.pi - np.arccos(tmp))
+        theta = np.arctan2(np.cos(alpha) - np.cos(beta), d - np.sin(alpha) + np.sin(beta))
+        t = self._mod2pi(alpha - theta + p / 2.0)
+        q = self._mod2pi(alpha - beta - t + p)
 
         return {
             'type': 'RLR',
             'segments': [(t, 'R'), (p, 'L'), (q, 'R')],
             'length': t + p + q
         }
+
+
+def _sample_per_segment(self, path: dict, num_points: int = 20) -> List[np.ndarray]:
+    """Sample each Dubins segment independently so short terminal turns are not collapsed."""
+    if path is None:
+        return []
+
+    x0, y0, h0 = path['start']
+    r = path['turn_radius']
+    segments = path['segments']
+    total_len = path.get('length', sum(seg_len * r for seg_len, _ in segments))
+    if num_points <= 1:
+        return [np.array([x0, y0], dtype=np.float64)]
+
+    spacing = max(total_len / (num_points - 1), 1e-6)
+    points = [np.array([x0, y0], dtype=np.float64)]
+    x, y, h = x0, y0, h0
+
+    for seg_len_norm, direction in segments:
+        seg_len = seg_len_norm * r
+        sx, sy, sh = x, y, h
+        n_seg = max(int(np.ceil(seg_len / spacing)), 1)
+        ph = sh
+
+        for i in range(1, n_seg + 1):
+            advance = min(seg_len, seg_len * i / n_seg)
+
+            if direction == 'S':
+                px = sx + advance * np.cos(sh)
+                py = sy + advance * np.sin(sh)
+                ph = sh
+            elif direction == 'L':
+                dtheta = advance / r
+                cx = sx - r * np.sin(sh)
+                cy = sy + r * np.cos(sh)
+                ph = sh + dtheta
+                px = cx + r * np.sin(ph)
+                py = cy - r * np.cos(ph)
+            else:  # direction == 'R'
+                dtheta = advance / r
+                cx = sx + r * np.sin(sh)
+                cy = sy - r * np.cos(sh)
+                ph = sh - dtheta
+                px = cx - r * np.sin(ph)
+                py = cy + r * np.cos(ph)
+
+            points.append(np.array([px, py], dtype=np.float64))
+
+        x, y, h = points[-1][0], points[-1][1], ph
+
+    x1, y1, _ = path['end']
+    points[-1] = np.array([x1, y1], dtype=np.float64)
+    return points
+
+
+DubinsPath.sample = _sample_per_segment

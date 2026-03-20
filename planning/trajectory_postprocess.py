@@ -278,7 +278,8 @@ class TrajectoryPostprocessor:
             dubins_path = self.dubins.compute(start_pose, end_pose)
             if dubins_path is not None:
                 # [调参] 按弧长自适应采样，间距约15m
-                n_pts = int(np.clip(dubins_path['length'] / 15.0, 4, 30))
+                sample_spacing = max(3.0, min(5.0, self.min_turn_radius / 30.0))
+                n_pts = int(np.clip(np.ceil(dubins_path['length'] / sample_spacing) + 1, 6, 200))
                 transition_pts = self.dubins.sample(dubins_path, num_points=n_pts)
                 if len(transition_pts) > 2:
                     # 替换接缝点: 移除 j 和 j+1，插入过渡弧
@@ -393,11 +394,25 @@ class TrajectoryPostprocessor:
                 insert_idx = i
 
         # 螺旋入口方向
-        if insert_idx > 0:
-            entry_pt = points[insert_idx - 1]
-            start_angle = np.arctan2(entry_pt[1] - cy, entry_pt[0] - cx)
+        insert_state_idx = min(max(insert_idx, 0), len(points) - 1)
+        insert_state_pt = points[insert_state_idx]
+        if insert_state_idx < len(points) - 1:
+            insert_dir = points[insert_state_idx + 1] - points[insert_state_idx]
+        elif insert_state_idx > 0:
+            insert_dir = points[insert_state_idx] - points[insert_state_idx - 1]
         else:
+            insert_dir = np.array([np.cos(approach_heading), np.sin(approach_heading)])
+
+        if np.linalg.norm(insert_dir) < 1e-6:
+            insert_heading = approach_heading
+        else:
+            insert_heading = np.arctan2(insert_dir[1], insert_dir[0])
+
+        radial = insert_state_pt - np.array([cx, cy])
+        if np.linalg.norm(radial) < 1e-6:
             start_angle = approach_heading + np.pi
+        else:
+            start_angle = np.arctan2(radial[1], radial[0])
 
         # 调整总角度使螺旋出口对齐
         total_angle = num_loops * 2 * np.pi
@@ -405,6 +420,12 @@ class TrajectoryPostprocessor:
         actual_end = start_angle - total_angle
         angle_correction = (desired_end - actual_end) % (2 * np.pi)
         total_angle += angle_correction
+
+        spiral_entry_pt = np.array([
+            cx + loiter_radius * np.cos(start_angle),
+            cy + loiter_radius * np.sin(start_angle)
+        ])
+        spiral_entry_heading = start_angle - np.pi / 2.0
 
         # 生成螺旋 2D 点
         points_per_loop = 36
@@ -417,6 +438,26 @@ class TrajectoryPostprocessor:
             x = cx + loiter_radius * np.cos(angle)
             y = cy + loiter_radius * np.sin(angle)
             spiral_path.append(np.array([x, y]))
+
+        entry_transition = []
+        entry_gap = np.linalg.norm(spiral_entry_pt - insert_state_pt)
+        if entry_gap > 1.0:
+            entry_dubins = self.dubins.compute(
+                (insert_state_pt[0], insert_state_pt[1], insert_heading),
+                (spiral_entry_pt[0], spiral_entry_pt[1], spiral_entry_heading)
+            )
+            if entry_dubins is not None:
+                sample_spacing = max(3.0, min(5.0, self.min_turn_radius / 30.0))
+                n_pts = int(np.clip(np.ceil(entry_dubins['length'] / sample_spacing) + 1, 6, 200))
+                sampled = self.dubins.sample(entry_dubins, num_points=n_pts)
+                entry_transition = [np.array([pt[0], pt[1]]) for pt in sampled]
+            else:
+                n_entry = max(3, int(entry_gap / 10.0))
+                for k in range(1, n_entry + 1):
+                    frac = k / n_entry
+                    entry_transition.append(
+                        insert_state_pt + frac * (spiral_entry_pt - insert_state_pt)
+                    )
 
         # 螺旋出口切线航向
         if len(spiral_path) >= 2:
@@ -440,7 +481,9 @@ class TrajectoryPostprocessor:
 
         transition_pts = []
         if dubins_transition is not None:
-            sampled = self.dubins.sample(dubins_transition, num_points=15)
+            sample_spacing = max(3.0, min(5.0, self.min_turn_radius / 30.0))
+            n_pts = int(np.clip(np.ceil(dubins_transition['length'] / sample_spacing) + 1, 6, 200))
+            sampled = self.dubins.sample(dubins_transition, num_points=n_pts)
             transition_pts = [np.array([pt[0], pt[1]]) for pt in sampled]
         else:
             # 回退: 直线连接
@@ -466,10 +509,13 @@ class TrajectoryPostprocessor:
                   f"半径={loiter_radius:.0f}m, "
                   f"圈数={total_angle / (2 * np.pi):.1f}")
 
-        # 拼接: path[:insert] + spiral + dubins_transition + [goal]
-        result = points[:insert_idx] + spiral_path
+        # 拼接: 路径前缀 + 入口过渡 + 螺旋 + 出口过渡 + [goal]
+        result = points[:insert_state_idx + 1]
+        if entry_transition:
+            result.extend(entry_transition[1:] if len(entry_transition) > 1 else entry_transition)
+        if spiral_path:
+            result.extend(spiral_path[1:] if result else spiral_path)
         if transition_pts:
-            # 跳过第一个点（与螺旋末点重复）
             result.extend(transition_pts[1:] if len(transition_pts) > 1 else transition_pts)
         result.append(points[-1].copy())
         return result
@@ -484,7 +530,7 @@ class TrajectoryPostprocessor:
             return points
 
         if spacing is None:
-            spacing = self.reference_speed * self.dt  # ~0.08m for 8m/s @ 100Hz
+            spacing = max(self.reference_speed * self.dt, min(8.0, self.min_turn_radius / 12.0))
 
         # 计算累积弧长
         arc_lengths = [0.0]
@@ -781,7 +827,7 @@ class TrajectoryPostprocessor:
             return self._resample_linear(waypoints)
 
         # 计算采样点数（基于参考速度和控制频率）
-        spacing = self.reference_speed * self.dt
+        spacing = max(self.reference_speed * self.dt, min(8.0, self.min_turn_radius / 12.0))
         n_samples = max(int(total_length / spacing), len(waypoints))
 
         # 均匀采样
@@ -806,7 +852,7 @@ class TrajectoryPostprocessor:
         if total_length < 1e-6:
             return waypoints
 
-        spacing = self.reference_speed * self.dt
+        spacing = max(self.reference_speed * self.dt, min(8.0, self.min_turn_radius / 12.0))
         n_samples = max(int(total_length / spacing), len(waypoints))
 
         resampled = []
@@ -1158,6 +1204,464 @@ def validate_trajectory(trajectory: Trajectory,
 # ============================================================
 #                     测试
 # ============================================================
+
+def validate_trajectory(trajectory: Trajectory,
+                       min_glide_ratio: float = 2.47,
+                       max_glide_ratio: float = 6.48,
+                       min_turn_radius: float = 50.0,
+                       hard_turn_radius_ratio: float = 0.95) -> dict:
+    """Validate trajectory feasibility against glide and turn-radius limits."""
+    result = {
+        'valid': True,
+        'errors': [],
+        'warnings': [],
+        'statistics': {}
+    }
+
+    if len(trajectory) < 2:
+        result['warnings'].append("trajectory has fewer than 2 points")
+        return result
+
+    positions = trajectory.to_position_array()
+    n_points = len(positions)
+    glide_ratios = []
+    turn_radii = []
+    soft_turn_violations = []
+    hard_turn_violations = []
+    window_size = 10
+
+    for i in range(0, n_points - window_size, window_size):
+        p1 = positions[i]
+        p2 = positions[i + window_size]
+        dz = p1[2] - p2[2]
+        dxy = np.linalg.norm(p2[:2] - p1[:2])
+
+        if dz <= 1.0:
+            continue
+
+        glide = dxy / dz
+        glide_ratios.append(glide)
+
+        if glide > max_glide_ratio:
+            result['errors'].append(
+                f"window {i // window_size}: glide ratio {glide:.2f} > max {max_glide_ratio:.2f}")
+            result['valid'] = False
+        elif glide < min_glide_ratio:
+            result['warnings'].append(
+                f"window {i // window_size}: glide ratio {glide:.2f} < min {min_glide_ratio:.2f}")
+
+    for i in range(len(trajectory)):
+        pt = trajectory[i]
+        if pt.curvature <= 1e-6:
+            continue
+
+        radius = 1.0 / pt.curvature
+        turn_radii.append(radius)
+
+        if radius < min_turn_radius * hard_turn_radius_ratio:
+            hard_turn_violations.append((i, radius))
+        elif radius < min_turn_radius:
+            soft_turn_violations.append((i, radius))
+
+    if hard_turn_violations:
+        result['valid'] = False
+        preview = hard_turn_violations[:10]
+        for idx, radius in preview:
+            result['errors'].append(
+                f"point {idx}: turn radius {radius:.1f}m < hard limit {min_turn_radius * hard_turn_radius_ratio:.1f}m")
+        if len(hard_turn_violations) > len(preview):
+            result['errors'].append(
+                f"and {len(hard_turn_violations) - len(preview)} more severe turn-radius violations")
+
+    if soft_turn_violations:
+        preview = soft_turn_violations[:10]
+        for idx, radius in preview:
+            result['warnings'].append(
+                f"point {idx}: turn radius {radius:.1f}m < target {min_turn_radius:.1f}m")
+        if len(soft_turn_violations) > len(preview):
+            result['warnings'].append(
+                f"and {len(soft_turn_violations) - len(preview)} more mild turn-radius violations")
+
+    if glide_ratios:
+        result['statistics']['glide_ratio'] = {
+            'min': min(glide_ratios),
+            'max': max(glide_ratios),
+            'mean': np.mean(glide_ratios)
+        }
+
+    if turn_radii:
+        result['statistics']['turn_radius'] = {
+            'min': min(turn_radii),
+            'max': max(turn_radii),
+            'mean': np.mean(turn_radii),
+            'soft_violation_count': len(soft_turn_violations),
+            'hard_violation_count': len(hard_turn_violations)
+        }
+
+    return result
+
+
+def _redistribute_altitude_trackable(self,
+                                     points_2d: List[np.ndarray],
+                                     z_start: float,
+                                     z_goal: float,
+                                     profile: str = "balanced") -> List[np.ndarray]:
+    """Front-load part of the descent so the reference stays trackable for the parafoil."""
+    n = len(points_2d)
+    if n < 2:
+        return [np.array([points_2d[0][0], points_2d[0][1], z_start])]
+
+    delta_z = z_start - z_goal
+    if abs(delta_z) < 1e-6:
+        return [np.array([pt[0], pt[1], z_start]) for pt in points_2d]
+
+    r_min = self.min_turn_radius
+    g_max = self.max_glide
+    g_min = self.min_glide
+
+    ds_2d = np.zeros(n - 1)
+    for i in range(n - 1):
+        ds_2d[i] = np.linalg.norm(points_2d[i + 1] - points_2d[i])
+
+    total_2d = float(np.sum(ds_2d))
+    if total_2d < 1e-6:
+        return [np.array([pt[0], pt[1], z_start]) for pt in points_2d]
+
+    required_glide = total_2d / max(delta_z, 1e-6)
+    min_required_drop = total_2d / max(g_max, 1e-6)
+    max_available_drop = total_2d / max(g_min, 1e-6)
+    if min_required_drop > delta_z + 0.5:
+        raise ValueError(
+            f"path too long for available altitude: required_glide={required_glide:.2f} > max={g_max:.2f}"
+        )
+    if max_available_drop < delta_z - 0.5:
+        raise ValueError(
+            f"path too short to dissipate altitude: required_glide={required_glide:.2f} < min={g_min:.2f}"
+        )
+
+    profile = str(profile or "balanced").lower()
+    frontload_gain = 0.55 if profile == "front_loaded" else 0.30
+    early_fraction = 0.20 if profile == "front_loaded" else 0.28
+    late_fraction = 0.62 if profile == "front_loaded" else 0.72
+    transition_progress = 0.78 if profile == "front_loaded" else 0.82
+    conservative_glide_cap = min(
+        g_max,
+        max(required_glide + (0.22 if profile == "front_loaded" else 0.45), g_min + 0.6),
+    )
+
+    curvatures = np.zeros(n)
+    for i in range(1, n - 1):
+        curvatures[i] = self._compute_curvature_2d(
+            points_2d[i - 1], points_2d[i], points_2d[i + 1]
+        )
+
+    weighted_dz = np.zeros(n - 1)
+    dz_floor = np.zeros(n - 1)
+    dz_ceil = np.zeros(n - 1)
+    cum_dist = np.zeros(n - 1)
+
+    cum_sum = 0.0
+    for i in range(n - 1):
+        cum_sum += ds_2d[i]
+        cum_dist[i] = cum_sum
+
+    for i in range(n - 1):
+        kappa = 0.5 * (curvatures[i] + curvatures[min(i + 1, n - 1)])
+        progress = cum_dist[i] / total_2d if total_2d > 1e-6 else 0.0
+
+        f_sym = max(0.0, 1.0 - kappa * r_min)
+        g_eff_min = g_max - f_sym * (g_max - g_min)
+
+        blend_fraction = early_fraction
+        if progress > transition_progress:
+            blend_fraction = late_fraction
+        elif progress > 0.55:
+            alpha = (progress - 0.55) / max(transition_progress - 0.55, 1e-6)
+            blend_fraction = early_fraction + alpha * (late_fraction - early_fraction)
+
+        g_target = g_eff_min + blend_fraction * (conservative_glide_cap - g_eff_min)
+        g_target = float(np.clip(g_target, g_eff_min, conservative_glide_cap))
+        frontload_weight = 1.0 + frontload_gain * (1.0 - progress)
+
+        if ds_2d[i] > 1e-6:
+            weighted_dz[i] = frontload_weight * ds_2d[i] / g_target
+            dz_floor[i] = ds_2d[i] / g_max
+            dz_ceil[i] = ds_2d[i] / g_eff_min
+        else:
+            weighted_dz[i] = 0.0
+            dz_floor[i] = 0.0
+            dz_ceil[i] = delta_z
+
+    min_feasible_drop = float(np.sum(dz_floor))
+    max_feasible_drop = float(np.sum(dz_ceil))
+    if min_feasible_drop > delta_z + 0.5:
+        raise ValueError(
+            f"path exceeds maximum glide envelope: min_drop={min_feasible_drop:.2f} > available={delta_z:.2f}"
+        )
+    if max_feasible_drop < delta_z - 0.5:
+        raise ValueError(
+            f"path cannot dissipate enough altitude: max_drop={max_feasible_drop:.2f} < target={delta_z:.2f}"
+        )
+
+    if np.sum(weighted_dz) > 1e-9:
+        final_dz = weighted_dz * (delta_z / np.sum(weighted_dz))
+    else:
+        final_dz = delta_z * (ds_2d / max(total_2d, 1e-9))
+
+    final_dz = np.clip(final_dz, dz_floor, dz_ceil)
+
+    for _ in range(40):
+        err = delta_z - np.sum(final_dz)
+        if abs(err) <= 1e-6:
+            break
+        if err > 0:
+            capacity = np.maximum(dz_ceil - final_dz, 0.0)
+            if np.sum(capacity) <= 1e-9:
+                break
+            weights = capacity * np.maximum(weighted_dz, 1e-6)
+            if np.sum(weights) <= 1e-9:
+                weights = capacity
+            delta = err * (weights / np.sum(weights))
+            final_dz += np.minimum(delta, capacity)
+        else:
+            capacity = np.maximum(final_dz - dz_floor, 0.0)
+            if np.sum(capacity) <= 1e-9:
+                break
+            reduce_priority = capacity * np.maximum(cum_dist / max(total_2d, 1e-6), 0.05)
+            if np.sum(reduce_priority) <= 1e-9:
+                reduce_priority = capacity
+            delta = (-err) * (reduce_priority / np.sum(reduce_priority))
+            final_dz -= np.minimum(delta, capacity)
+
+    max_descent_rate_change = 0.035 if profile == "front_loaded" else 0.045
+    if n > 2:
+        rates = np.zeros(n - 1)
+        valid = ds_2d > 1e-6
+        rates[valid] = final_dz[valid] / ds_2d[valid]
+
+        for _ in range(3):
+            for i in range(1, n - 1):
+                if not valid[i] or not valid[i - 1]:
+                    continue
+                rates[i] = np.clip(
+                    rates[i],
+                    rates[i - 1] - max_descent_rate_change,
+                    rates[i - 1] + max_descent_rate_change,
+                )
+            for i in range(n - 3, -1, -1):
+                if not valid[i] or not valid[i + 1]:
+                    continue
+                rates[i] = np.clip(
+                    rates[i],
+                    rates[i + 1] - max_descent_rate_change,
+                    rates[i + 1] + max_descent_rate_change,
+                )
+
+            rates[valid] = np.clip(
+                rates[valid],
+                dz_floor[valid] / ds_2d[valid],
+                dz_ceil[valid] / ds_2d[valid],
+            )
+            final_dz = rates * ds_2d
+
+            err = delta_z - np.sum(final_dz)
+            if abs(err) <= 1e-6:
+                continue
+            if err > 0:
+                capacity = np.maximum(dz_ceil - final_dz, 0.0)
+                if np.sum(capacity) > 1e-9:
+                    weights = capacity * np.maximum(weighted_dz, 1e-6)
+                    if np.sum(weights) <= 1e-9:
+                        weights = capacity
+                    final_dz += err * (weights / np.sum(weights))
+                    final_dz = np.minimum(final_dz, dz_ceil)
+            else:
+                capacity = np.maximum(final_dz - dz_floor, 0.0)
+                if np.sum(capacity) > 1e-9:
+                    weights = capacity * np.maximum(cum_dist / max(total_2d, 1e-6), 0.05)
+                    if np.sum(weights) <= 1e-9:
+                        weights = capacity
+                    final_dz -= (-err) * (weights / np.sum(weights))
+                    final_dz = np.maximum(final_dz, dz_floor)
+
+    total_final = float(np.sum(final_dz))
+    residual = delta_z - total_final
+    if abs(residual) > 0.5:
+        raise ValueError(
+            f"altitude redistribution residual too large: residual={residual:.2f}m"
+        )
+    if abs(residual) > 1e-6:
+        if residual > 0:
+            capacity = np.maximum(dz_ceil - final_dz, 0.0)
+        else:
+            capacity = np.maximum(final_dz - dz_floor, 0.0)
+        idx = int(np.argmax(capacity))
+        if capacity[idx] + 1e-6 < abs(residual):
+            raise ValueError(
+                f"unable to absorb residual altitude error: residual={residual:.3f}m"
+            )
+        final_dz[idx] += residual
+
+    result = []
+    cum = 0.0
+    for i in range(n):
+        z = z_start - cum
+        result.append(np.array([points_2d[i][0], points_2d[i][1], z]))
+        if i < n - 1:
+            cum += final_dz[i]
+    result[-1][2] = z_goal
+
+    if not self.quiet:
+        print(
+            f"    [altitude-profile] profile={profile}, required_glide={required_glide:.2f}, "
+            f"cap={conservative_glide_cap:.2f}"
+        )
+
+    return result
+
+
+def _process_dubins_preserve_clearance(self,
+                                      path: List[np.ndarray],
+                                      edge_paths: Dict,
+                                      node_chain: List[Tuple[int, int]],
+                                      end_heading: Optional[float] = None) -> Trajectory:
+    """Prefer the planner's original Dubins edges and avoid postprocess shortcuts."""
+    waypoints = [np.asarray(wp, dtype=np.float64) for wp in path]
+    z_start = waypoints[0][2]
+    z_goal = waypoints[-1][2]
+
+    points_2d, _edge_lengths = self._stitch_edge_paths(edge_paths, node_chain, waypoints)
+    points_2d = self._inject_spiral_dubins(points_2d, z_start, z_goal, end_heading)
+    deduped_points_2d = []
+    for pt in points_2d:
+        pt = np.asarray(pt, dtype=np.float64)
+        if not deduped_points_2d or np.linalg.norm(pt - deduped_points_2d[-1]) > 1e-6:
+            deduped_points_2d.append(pt)
+    points_2d = self._resample_arc_length(deduped_points_2d)
+    points_3d = self._redistribute_altitude_constrained(points_2d, z_start, z_goal)
+    trajectory = self._create_trajectory(points_3d, end_heading)
+    self._validate_trajectory(trajectory)
+    return trajectory
+
+
+TrajectoryPostprocessor._redistribute_altitude_constrained = _redistribute_altitude_trackable
+TrajectoryPostprocessor._process_dubins_aware = _process_dubins_preserve_clearance
+
+
+def validate_trajectory(trajectory: Trajectory,
+                       min_glide_ratio: float = 2.47,
+                       max_glide_ratio: float = 6.48,
+                       min_turn_radius: float = 50.0,
+                       hard_turn_radius_ratio: float = 0.95) -> dict:
+    """Robust validation that tolerates a few discretization spikes but rejects systematic infeasibility."""
+    result = {
+        'valid': True,
+        'errors': [],
+        'warnings': [],
+        'statistics': {}
+    }
+
+    if len(trajectory) < 2:
+        result['warnings'].append("trajectory has fewer than 2 points")
+        return result
+
+    positions = trajectory.to_position_array()
+    n_points = len(positions)
+    glide_ratios = []
+    turn_radii = []
+    soft_turn_violations = []
+    hard_turn_violations = []
+    window_size = 10
+
+    for i in range(0, n_points - window_size, window_size):
+        p1 = positions[i]
+        p2 = positions[i + window_size]
+        dz = p1[2] - p2[2]
+        dxy = np.linalg.norm(p2[:2] - p1[:2])
+
+        if dz <= 1.0:
+            continue
+
+        glide = dxy / dz
+        glide_ratios.append(glide)
+
+        if glide > max_glide_ratio * 1.10:
+            result['errors'].append(
+                f"window {i // window_size}: glide ratio {glide:.2f} > max {max_glide_ratio:.2f}")
+            result['valid'] = False
+        elif glide > max_glide_ratio:
+            result['warnings'].append(
+                f"window {i // window_size}: glide ratio {glide:.2f} slightly above max {max_glide_ratio:.2f}")
+        elif glide < min_glide_ratio:
+            result['warnings'].append(
+                f"window {i // window_size}: glide ratio {glide:.2f} < min {min_glide_ratio:.2f}")
+
+    for i in range(len(trajectory)):
+        pt = trajectory[i]
+        if pt.curvature <= 1e-6:
+            continue
+
+        radius = 1.0 / pt.curvature
+        turn_radii.append(radius)
+
+        if radius < min_turn_radius * hard_turn_radius_ratio:
+            hard_turn_violations.append((i, radius))
+        elif radius < min_turn_radius:
+            soft_turn_violations.append((i, radius))
+
+    hard_ratio = (
+        len(hard_turn_violations) / len(turn_radii)
+        if turn_radii else 0.0
+    )
+    robust_min_radius = float(np.percentile(turn_radii, 5)) if len(turn_radii) >= 5 else (
+        min(turn_radii) if turn_radii else float('inf')
+    )
+    severe_hard = (
+        len(hard_turn_violations) > 3 and
+        (hard_ratio > 0.05 or robust_min_radius < min_turn_radius * hard_turn_radius_ratio)
+    )
+    if severe_hard:
+        result['valid'] = False
+
+    if hard_turn_violations:
+        preview = hard_turn_violations[:10]
+        bucket = result['errors'] if severe_hard else result['warnings']
+        label = "hard limit" if severe_hard else "isolated hard-limit"
+        for idx, radius in preview:
+            bucket.append(
+                f"point {idx}: turn radius {radius:.1f}m < {label} {min_turn_radius * hard_turn_radius_ratio:.1f}m")
+        if len(hard_turn_violations) > len(preview):
+            bucket.append(
+                f"and {len(hard_turn_violations) - len(preview)} more hard turn-radius violations")
+
+    if soft_turn_violations:
+        preview = soft_turn_violations[:10]
+        for idx, radius in preview:
+            result['warnings'].append(
+                f"point {idx}: turn radius {radius:.1f}m < target {min_turn_radius:.1f}m")
+        if len(soft_turn_violations) > len(preview):
+            result['warnings'].append(
+                f"and {len(soft_turn_violations) - len(preview)} more mild turn-radius violations")
+
+    if glide_ratios:
+        result['statistics']['glide_ratio'] = {
+            'min': min(glide_ratios),
+            'max': max(glide_ratios),
+            'mean': np.mean(glide_ratios)
+        }
+
+    if turn_radii:
+        result['statistics']['turn_radius'] = {
+            'min': min(turn_radii),
+            'max': max(turn_radii),
+            'mean': np.mean(turn_radii),
+            'robust_min': robust_min_radius,
+            'soft_violation_count': len(soft_turn_violations),
+            'hard_violation_count': len(hard_turn_violations)
+        }
+
+    return result
+
 
 if __name__ == "__main__":
     from planning.kinodynamic_rrt import KinodynamicRRTStar

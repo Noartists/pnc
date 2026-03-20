@@ -30,8 +30,9 @@ if ROOT_DIR not in sys.path:
 from planning.map_manager import MapManager
 from planning.trajectory import Trajectory, TrajectoryPoint
 from planning.kinodynamic_rrt import KinodynamicRRTStar
-from planning.trajectory_postprocess import TrajectoryPostprocessor
+from planning.trajectory_postprocess import TrajectoryPostprocessor, validate_trajectory
 from control.adrc_controller import ParafoilADRCController, ControlOutput
+from control.pid_controller import ParafoilPIDController
 from models.parafoil_model import ParafoilParams, parafoil_dynamics
 
 # Benchmark 框架
@@ -120,6 +121,8 @@ class ClosedLoopSimulator:
                  dynamics_dt: float = 0.001,
                  seed: int = None,
                  scene_name: str = "default",
+                 controller_type: str = "adrc",
+                 controller_kwargs: Optional[Dict[str, Any]] = None,
                  quiet: bool = False):
         """
         参数:
@@ -135,6 +138,8 @@ class ClosedLoopSimulator:
         self.dynamics_dt = dynamics_dt
         self.scene_name = scene_name
         self.quiet = quiet
+        self.controller_type = controller_type.lower()
+        self.controller_kwargs = dict(controller_kwargs or {})
         
         # 保存配置路径
         self.map_config_path = map_config_path
@@ -213,6 +218,77 @@ class ClosedLoopSimulator:
         # 调试模式（可通过参数控制）
         # 静默模式下禁用调试输出
         self.controller_debug = not self.quiet  # 静默模式下关闭控制器调试
+        if self.controller_type == "pid":
+            self.controller = ParafoilPIDController(
+                heading_kp=1.8,
+                heading_ki=0.10,
+                heading_kd=0.60,
+                heading_integral_limit=0.9,
+                heading_derivative_alpha=0.88,
+                heading_eso_omega=40.0,
+                heading_td_r=20.0,
+                heading_b0=0.5,
+                lateral_kp=0.01,
+                lateral_kd=0.003,
+                glide_ratio_natural=6.48,
+                glide_ratio_min=2.47,
+                descent_kp=0.5,
+                descent_margin=1.15,
+                reference_speed=reference_speed,
+                min_turn_radius=min_turn_r,
+                lookahead_distance=100.0,
+                max_deflection=1.0,
+                dt=control_dt
+            )
+        elif self.controller_type != "adrc":
+            raise ValueError(f"Unsupported controller_type: {controller_type}")
+
+        shared_controller_config = {
+            'heading_eso_omega': 40.0,
+            'heading_td_r': 20.0,
+            'heading_b0': 0.5,
+            'lateral_kp': 0.14,
+            'lateral_kd': 0.03,
+            'glide_ratio_natural': 6.48,
+            'glide_ratio_min': 2.47,
+            'descent_kp': 0.22,
+            'descent_margin': 1.0,
+            'reference_speed': reference_speed,
+            'min_turn_radius': min_turn_r,
+            'lookahead_distance': 85.0,
+            'lookahead_min_distance': 30.0,
+            'lookahead_max_distance': 110.0,
+            'lookahead_error_scale': 0.025,
+            'closest_search_window': 120,
+            'closest_reacquire_distance': 35.0,
+            'closest_reacquire_window': 800,
+            'closest_backtrack_window': 4,
+            'cross_track_softening': 3.0,
+            'max_cross_track_heading_correction': np.radians(32.0),
+            'max_deflection': 1.0,
+            'dt': control_dt,
+        }
+
+        if self.controller_type == "pid":
+            self.controller_config = dict(shared_controller_config)
+            self.controller_config.update({
+                'heading_kp': 1.8,
+                'heading_ki': 0.10,
+                'heading_kd': 0.60,
+                'heading_integral_limit': 0.9,
+                'heading_derivative_alpha': 0.88,
+            })
+            self.controller_config.update(self.controller_kwargs)
+            self.controller = ParafoilPIDController(**self.controller_config)
+        else:
+            self.controller_config = dict(shared_controller_config)
+            self.controller_config.update({
+                'heading_kp': 6.0,
+                'heading_kd': 2.0,
+            })
+            self.controller_config.update(self.controller_kwargs)
+            self.controller = ParafoilADRCController(**self.controller_config)
+
         if self.controller_debug:
             self.controller.set_debug(True)
         
@@ -249,7 +325,8 @@ class ClosedLoopSimulator:
         
         self.failure_detector = FailureDetector(
             thresholds=FailureThresholds(
-                landing_radius=20.0,
+                landing_radius=50.0,
+                landing_altitude=20.0,
                 safety_margin=self.map_manager.constraints.safety_margin
             ),
             no_fly_zones=nfz_list,
@@ -844,7 +921,13 @@ class ClosedLoopSimulator:
                 break
             
             # 停止条件: 到达目标
-            if stop_on_target and self.controller.is_finished(state[0:3], threshold=target_threshold):
+            terminal_altitude_gate = (
+                self.failure_detector.thresholds.landing_altitude
+                if enable_failure_detection else 20.0
+            )
+            if (stop_on_target and
+                    state[2] <= terminal_altitude_gate and
+                    self.controller.is_finished(state[0:3], threshold=target_threshold)):
                 if verbose:
                     print(f"\n  [到达目标] t={t:.1f}s")
                 # 检查是否真正成功
@@ -968,7 +1051,7 @@ class ClosedLoopSimulator:
         # 场景信息
         metrics_output.scene = self.scene_name
         metrics_output.wind_speed = 0.0  # 目前无风
-        metrics_output.controller = "adrc"
+        metrics_output.controller = self.controller_type
         
         # 成功判定
         final_pos = self._last_final_state[0:3] if hasattr(self, '_last_final_state') else self.log.position[-1]
@@ -1130,7 +1213,9 @@ class ClosedLoopSimulator:
         
         # 添加控制器参数（这里简化处理）
         configs['controller_config'] = {
-            'type': 'adrc'
+            'type': self.controller_type,
+            'params': getattr(self, 'controller_config', {}),
+            'overrides': self.controller_kwargs
         }
         
         # 风场配置
@@ -1385,6 +1470,1242 @@ class ClosedLoopSimulator:
 #                     主程序
 # ============================================================
 
+def _build_raw_edge_trajectory(self,
+                               postprocessor: TrajectoryPostprocessor,
+                               candidate_path: List[np.ndarray],
+                               end_heading: Optional[float]) -> Trajectory:
+    deduped_points = []
+    for pt in candidate_path:
+        pt = np.asarray(pt, dtype=np.float64).copy()
+        if not deduped_points or np.linalg.norm(pt - deduped_points[-1]) > 1e-6:
+            deduped_points.append(pt)
+
+    if len(deduped_points) < 2:
+        return Trajectory(dt=self.control_dt)
+    return postprocessor._create_trajectory(deduped_points, end_heading)
+
+
+def _build_junction_smoothed_trajectory(self,
+                                        postprocessor: TrajectoryPostprocessor,
+                                        candidate_path: List[np.ndarray],
+                                        candidate_info: Dict[str, Any],
+                                        end_heading: Optional[float]) -> Trajectory:
+    waypoints = [np.asarray(wp, dtype=np.float64) for wp in candidate_path]
+    if len(waypoints) < 2:
+        return Trajectory(dt=self.control_dt)
+
+    z_start = waypoints[0][2]
+    z_goal = (
+        self.map_manager.target.position[2]
+        if self.map_manager is not None and self.map_manager.target is not None
+        else waypoints[-1][2]
+    )
+    points_2d = [wp[:2].copy() for wp in waypoints]
+    total_2d = sum(np.linalg.norm(points_2d[i + 1] - points_2d[i]) for i in range(len(points_2d) - 1))
+    required_glide = total_2d / max(z_start - z_goal, 1e-6) if z_start > z_goal else float("inf")
+    trackable_min_glide = 5.0
+    if required_glide < trackable_min_glide - 0.05:
+        extra_length = (z_start - z_goal) * trackable_min_glide - total_2d
+        points_2d = _append_terminal_loiter(
+            points_2d,
+            extra_length,
+            postprocessor.min_turn_radius,
+            end_heading,
+        )
+    elif required_glide < postprocessor.min_glide + 0.10:
+        points_2d = postprocessor._inject_spiral_dubins(points_2d, z_start, z_goal, end_heading)
+
+    deduped_points = []
+    for pt in points_2d:
+        pt = np.asarray(pt, dtype=np.float64)
+        if not deduped_points or np.linalg.norm(pt - deduped_points[-1]) > 1e-6:
+            deduped_points.append(pt)
+
+    points_2d = postprocessor._resample_arc_length(deduped_points)
+    points_3d = _redistribute_altitude_with_clearance(
+        postprocessor,
+        points_2d,
+        z_start,
+        z_goal,
+        profile="balanced",
+        end_heading=end_heading,
+    )
+    return postprocessor._create_trajectory(points_3d, end_heading)
+
+
+def _build_profiled_trajectory(self,
+                               postprocessor: TrajectoryPostprocessor,
+                               candidate_path: List[np.ndarray],
+                               candidate_info: Dict[str, Any],
+                               end_heading: Optional[float],
+                               profile: str = "front_loaded") -> Trajectory:
+    waypoints = [np.asarray(wp, dtype=np.float64) for wp in candidate_path]
+    if len(waypoints) < 2:
+        return Trajectory(dt=self.control_dt)
+
+    z_start = waypoints[0][2]
+    z_goal = (
+        self.map_manager.target.position[2]
+        if self.map_manager is not None and self.map_manager.target is not None
+        else waypoints[-1][2]
+    )
+
+    points_2d = [wp[:2].copy() for wp in waypoints]
+    total_2d = sum(np.linalg.norm(points_2d[i + 1] - points_2d[i]) for i in range(len(points_2d) - 1))
+    required_glide = total_2d / max(z_start - z_goal, 1e-6) if z_start > z_goal else float("inf")
+    trackable_min_glide = 5.0
+    if required_glide < trackable_min_glide - 0.05:
+        extra_length = (z_start - z_goal) * trackable_min_glide - total_2d
+        points_2d = _append_terminal_loiter(
+            points_2d,
+            extra_length,
+            postprocessor.min_turn_radius,
+            end_heading,
+        )
+    elif required_glide < postprocessor.min_glide + 0.10:
+        points_2d = postprocessor._inject_spiral_dubins(points_2d, z_start, z_goal, end_heading)
+
+    deduped_points = []
+    for pt in points_2d:
+        pt = np.asarray(pt, dtype=np.float64)
+        if not deduped_points or np.linalg.norm(pt - deduped_points[-1]) > 1e-6:
+            deduped_points.append(pt)
+
+    if len(deduped_points) < 2:
+        return Trajectory(dt=self.control_dt)
+
+    points_2d = postprocessor._resample_arc_length(deduped_points)
+    points_3d = _redistribute_altitude_with_clearance(
+        postprocessor,
+        points_2d,
+        z_start,
+        z_goal,
+        profile=profile,
+        end_heading=end_heading,
+    )
+    return postprocessor._create_trajectory(points_3d, end_heading)
+
+
+def _planner_obstacle_clearance_floor(self, xy: np.ndarray) -> float:
+    floor_z = float(self.min_altitude)
+    margin = float(self.map.constraints.safety_margin)
+    probe = np.array([xy[0], xy[1], 0.0], dtype=np.float64)
+
+    for obs in self.map.obstacles:
+        if hasattr(obs, "center") and hasattr(obs, "radius"):
+            xy_dist = np.linalg.norm(
+                np.asarray(xy, dtype=np.float64) - np.asarray(obs.center[:2], dtype=np.float64)
+            )
+            if xy_dist < float(obs.radius) + margin:
+                floor_z = max(floor_z, float(obs.z_max) + margin)
+        elif hasattr(obs, "polygon"):
+            xy_dist = float(obs.polygon.distance(probe))
+            if xy_dist < margin:
+                floor_z = max(floor_z, float(obs.z_max) + margin)
+
+    return floor_z
+
+
+def _planner_reassign_altitude_clearance_aware(self,
+                                               path: List[np.ndarray],
+                                               z_start: float,
+                                               z_goal: float,
+                                               goal_heading: float) -> Tuple[Optional[List[np.ndarray]], float]:
+    if len(path) < 2:
+        return path, 0.0
+
+    original_path = [pt.copy() for pt in path]
+
+    delta_z = z_start - z_goal
+    if delta_z <= 0:
+        return path, float("inf")
+
+    total_len_2d = self._path_length_2d(path)
+    if total_len_2d < 1.0:
+        return path, 0.0
+
+    required_glide = total_len_2d / delta_z
+    if required_glide > self.max_glide * 1.001:
+        return None, required_glide
+
+    path = [pt.copy() for pt in path]
+    n_points = len(path)
+    seg_len_2d = np.array([
+        np.linalg.norm(path[i + 1][:2] - path[i][:2])
+        for i in range(n_points - 1)
+    ], dtype=np.float64)
+
+    dz_floor = seg_len_2d / max(self.max_glide, 1e-6)
+    dz_ceil = seg_len_2d / max(self.min_glide, 1e-6)
+    if float(np.sum(dz_floor)) > delta_z + 0.5:
+        return original_path, required_glide
+    if float(np.sum(dz_ceil)) < delta_z - 0.5:
+        return original_path, required_glide
+
+    clearance_floor = np.array([
+        min(self._obstacle_clearance_floor(pt[:2]), z_start)
+        for pt in path
+    ], dtype=np.float64)
+    clearance_floor[0] = z_start
+    clearance_floor[-1] = z_goal
+    max_drop_prefix = np.clip(z_start - clearance_floor, 0.0, delta_z)
+
+    cum_min = np.concatenate(([0.0], np.cumsum(dz_floor)))
+    if np.any(cum_min - max_drop_prefix > 0.5):
+        return original_path, required_glide
+
+    # Start from the shallowest feasible descent and push extra drop as late as possible.
+    dz = dz_floor.copy()
+    residual = float(delta_z - np.sum(dz))
+
+    for seg_idx in range(len(dz) - 1, -1, -1):
+        if residual <= 1e-6:
+            break
+
+        cum_drop = np.concatenate(([0.0], np.cumsum(dz)))
+        slack = max_drop_prefix - cum_drop
+        suffix_slack = (
+            float(np.min(slack[seg_idx + 1:]))
+            if seg_idx + 1 < len(slack) else float("inf")
+        )
+        if suffix_slack <= 1e-9:
+            continue
+
+        seg_capacity = float(dz_ceil[seg_idx] - dz[seg_idx])
+        if seg_capacity <= 1e-9:
+            continue
+
+        add = min(residual, seg_capacity, suffix_slack)
+        if add <= 1e-9:
+            continue
+
+        dz[seg_idx] += add
+        residual -= add
+
+    if residual > 0.5:
+        return original_path, required_glide
+
+    cum_drop = 0.0
+    path[0][2] = z_start
+    for i in range(1, n_points):
+        cum_drop += dz[i - 1]
+        path[i][2] = z_start - cum_drop
+    path[-1][2] = z_goal
+
+    for i, pt in enumerate(path):
+        if pt[2] + 1e-6 < clearance_floor[i]:
+            return original_path, required_glide
+
+    if self._has_collision_path(path):
+        return original_path, required_glide
+
+    return path, required_glide
+
+
+def _postprocessor_obstacle_clearance_floor(postprocessor: TrajectoryPostprocessor,
+                                            xy: np.ndarray,
+                                            z_start: float,
+                                            z_goal: float) -> float:
+    map_manager = postprocessor.map_manager
+    if map_manager is None:
+        return float(z_goal)
+
+    target_xy = (
+        np.asarray(map_manager.target.position[:2], dtype=np.float64)
+        if map_manager.target is not None else None
+    )
+    terminal_taper_radius = float(max(120.0, 1.25 * postprocessor.min_turn_radius))
+    baseline_floor = float(max(map_manager.constraints.min_altitude, z_goal))
+    if target_xy is not None:
+        dist_to_goal = float(np.linalg.norm(np.asarray(xy, dtype=np.float64) - target_xy))
+        if dist_to_goal < terminal_taper_radius:
+            alpha = dist_to_goal / max(terminal_taper_radius, 1e-6)
+            baseline_floor = z_goal + alpha * (baseline_floor - z_goal)
+
+    floor_z = baseline_floor
+    margin = float(map_manager.constraints.safety_margin)
+    probe = np.array([xy[0], xy[1], 0.0], dtype=np.float64)
+
+    for obs in map_manager.obstacles:
+        if hasattr(obs, "center") and hasattr(obs, "radius"):
+            xy_dist = np.linalg.norm(
+                np.asarray(xy, dtype=np.float64) - np.asarray(obs.center[:2], dtype=np.float64)
+            )
+            if xy_dist < float(obs.radius) + margin:
+                floor_z = max(floor_z, float(obs.z_max) + margin)
+        elif hasattr(obs, "polygon"):
+            xy_dist = float(obs.polygon.distance(probe))
+            if xy_dist < margin:
+                floor_z = max(floor_z, float(obs.z_max) + margin)
+
+    return min(floor_z, z_start)
+
+
+def _append_terminal_loiter(points_2d: List[np.ndarray],
+                            extra_length: float,
+                            min_turn_radius: float,
+                            end_heading: Optional[float]) -> List[np.ndarray]:
+    if len(points_2d) < 2 or extra_length <= 1.0:
+        return [pt.copy() for pt in points_2d]
+
+    goal_xy = np.asarray(points_2d[-1], dtype=np.float64)
+    prev_xy = np.asarray(points_2d[-2], dtype=np.float64)
+    if end_heading is not None:
+        approach_heading = float(end_heading)
+    else:
+        approach_heading = float(np.arctan2(goal_xy[1] - prev_xy[1], goal_xy[0] - prev_xy[0]))
+
+    radius = float(max(min_turn_radius * 2.0, 1.0))
+    base_length = float(np.linalg.norm(goal_xy - prev_xy))
+
+    def build_arc(direction: float, arc_angle: float) -> Tuple[float, List[np.ndarray]]:
+        theta_goal = approach_heading - direction * (np.pi / 2.0)
+        theta_start = theta_goal - direction * arc_angle
+        center = goal_xy - radius * np.array([np.cos(theta_goal), np.sin(theta_goal)])
+        start_xy = center + radius * np.array([np.cos(theta_start), np.sin(theta_start)])
+        total_len = np.linalg.norm(prev_xy - start_xy) + radius * arc_angle
+        added_len = total_len - base_length
+
+        n_arc = max(8, int(np.ceil(arc_angle / (np.pi / 18.0))) + 1)
+        arc_points = []
+        for i in range(n_arc):
+            frac = i / max(n_arc - 1, 1)
+            theta = theta_start + direction * frac * arc_angle
+            arc_points.append(center + radius * np.array([np.cos(theta), np.sin(theta)]))
+        return added_len, arc_points
+
+    best_points = None
+    best_err = float("inf")
+    for direction in (-1.0, 1.0):
+        low = 0.02
+        high = max(extra_length / radius, 0.02)
+        while True:
+            added_len, _ = build_arc(direction, high)
+            if added_len >= extra_length or high >= 6.0 * np.pi:
+                break
+            high *= 1.5
+
+        for _ in range(18):
+            mid = 0.5 * (low + high)
+            added_len, _ = build_arc(direction, mid)
+            if added_len >= extra_length:
+                high = mid
+            else:
+                low = mid
+
+        added_len, arc_points = build_arc(direction, high)
+        err = abs(added_len - extra_length)
+        if err < best_err:
+            best_err = err
+            best_points = arc_points
+
+    if not best_points:
+        return [pt.copy() for pt in points_2d]
+
+    result = [np.asarray(pt, dtype=np.float64).copy() for pt in points_2d[:-1]]
+    if result and np.linalg.norm(best_points[0] - result[-1]) < 1e-6:
+        result.extend(best_points[1:])
+    else:
+        result.extend(best_points)
+    return result
+
+
+def _redistribute_altitude_with_clearance(postprocessor: TrajectoryPostprocessor,
+                                          points_2d: List[np.ndarray],
+                                          z_start: float,
+                                          z_goal: float,
+                                          profile: str = "balanced",
+                                          end_heading: Optional[float] = None,
+                                          allow_terminal_extension: bool = True,
+                                          anchor_floors: Optional[List[Tuple[np.ndarray, float]]] = None) -> List[np.ndarray]:
+    n_points = len(points_2d)
+    if n_points < 2:
+        return [np.array([points_2d[0][0], points_2d[0][1], z_start], dtype=np.float64)]
+
+    delta_z = z_start - z_goal
+    if abs(delta_z) < 1e-6:
+        return [np.array([pt[0], pt[1], z_start], dtype=np.float64) for pt in points_2d]
+
+    seg_len_2d = np.array([
+        np.linalg.norm(points_2d[i + 1] - points_2d[i])
+        for i in range(n_points - 1)
+    ], dtype=np.float64)
+    total_2d = float(np.sum(seg_len_2d))
+    if total_2d < 1e-6:
+        return [np.array([pt[0], pt[1], z_start], dtype=np.float64) for pt in points_2d]
+
+    g_max = float(postprocessor.max_glide)
+    g_min = float(postprocessor.min_glide)
+    min_required_drop = total_2d / max(g_max, 1e-6)
+    max_available_drop = total_2d / max(g_min, 1e-6)
+    if min_required_drop > delta_z + 0.5:
+        raise ValueError(
+            f"path too long for available altitude: required_glide={total_2d / max(delta_z, 1e-6):.2f} > max={g_max:.2f}"
+        )
+    if max_available_drop < delta_z - 0.5:
+        raise ValueError(
+            f"path too short to dissipate altitude: required_glide={total_2d / max(delta_z, 1e-6):.2f} < min={g_min:.2f}"
+        )
+
+    clearance_floor = np.array([
+        _postprocessor_obstacle_clearance_floor(postprocessor, pt, z_start, z_goal)
+        for pt in points_2d
+    ], dtype=np.float64)
+    clearance_floor[0] = z_start
+    clearance_floor[-1] = z_goal
+    if anchor_floors:
+        for anchor_xy, anchor_z in anchor_floors:
+            if anchor_xy is None:
+                continue
+            anchor_xy = np.asarray(anchor_xy, dtype=np.float64)
+            anchor_idx = int(np.argmin([
+                np.linalg.norm(np.asarray(pt, dtype=np.float64) - anchor_xy)
+                for pt in points_2d
+            ]))
+            clearance_floor[anchor_idx] = max(
+                clearance_floor[anchor_idx],
+                min(float(anchor_z), z_start)
+            )
+    max_drop_prefix = np.clip(z_start - clearance_floor, 0.0, delta_z)
+
+    dz_floor = seg_len_2d / max(g_max, 1e-6)
+    dz_ceil = seg_len_2d / max(g_min, 1e-6)
+    cum_min = np.concatenate(([0.0], np.cumsum(dz_floor)))
+    if np.any(cum_min - max_drop_prefix > 0.5):
+        raise ValueError("clearance floor conflicts with available altitude budget")
+
+    profile_name = str(profile or "balanced").lower()
+    curvatures = np.zeros(n_points, dtype=np.float64)
+    for idx in range(1, n_points - 1):
+        curvatures[idx] = postprocessor._compute_curvature_2d(
+            points_2d[idx - 1], points_2d[idx], points_2d[idx + 1]
+        )
+
+    if profile_name == "front_loaded":
+        frontload_gain = 0.70
+        early_fraction = 0.16
+        late_fraction = 0.58
+        transition_progress = 0.72
+        conservative_margin = 0.22
+    elif profile_name == "approach":
+        frontload_gain = 0.55
+        early_fraction = 0.20
+        late_fraction = 0.68
+        transition_progress = 0.76
+        conservative_margin = 0.28
+    else:
+        frontload_gain = 0.45
+        early_fraction = 0.24
+        late_fraction = 0.74
+        transition_progress = 0.80
+        conservative_margin = 0.38
+
+    required_glide = total_2d / max(delta_z, 1e-6)
+    conservative_glide_cap = min(
+        g_max * 0.94,
+        max(required_glide + conservative_margin, g_min + 0.65),
+    )
+    conservative_glide_cap = float(np.clip(conservative_glide_cap, g_min + 0.2, g_max))
+
+    weighted_dz = np.zeros(n_points - 1, dtype=np.float64)
+    cum_dist = np.cumsum(seg_len_2d)
+    r_min = float(postprocessor.min_turn_radius)
+    for idx in range(n_points - 1):
+        progress = cum_dist[idx] / max(total_2d, 1e-6)
+        kappa = 0.5 * (curvatures[idx] + curvatures[min(idx + 1, n_points - 1)])
+        f_sym = max(0.0, 1.0 - kappa * r_min)
+        g_eff_min = g_max - f_sym * (g_max - g_min)
+
+        blend_fraction = early_fraction
+        if progress > transition_progress:
+            blend_fraction = late_fraction
+        elif progress > 0.55:
+            alpha = (progress - 0.55) / max(transition_progress - 0.55, 1e-6)
+            blend_fraction = early_fraction + alpha * (late_fraction - early_fraction)
+
+        g_target = g_eff_min + blend_fraction * (conservative_glide_cap - g_eff_min)
+        g_target = float(np.clip(g_target, g_eff_min, conservative_glide_cap))
+        frontload_weight = 1.0 + frontload_gain * (1.0 - progress)
+        weighted_dz[idx] = frontload_weight * seg_len_2d[idx] / max(g_target, 1e-6)
+
+    def late_allocate() -> Tuple[np.ndarray, float]:
+        dz_late = dz_floor.copy()
+        residual_late = float(delta_z - np.sum(dz_late))
+        for seg_idx in range(len(dz_late) - 1, -1, -1):
+            if residual_late <= 1e-6:
+                break
+
+            cum_drop_late = np.concatenate(([0.0], np.cumsum(dz_late)))
+            slack_late = max_drop_prefix - cum_drop_late
+            suffix_slack_late = (
+                float(np.min(slack_late[seg_idx + 1:]))
+                if seg_idx + 1 < len(slack_late) else float("inf")
+            )
+            if suffix_slack_late <= 1e-9:
+                continue
+
+            seg_capacity_late = float(dz_ceil[seg_idx] - dz_late[seg_idx])
+            if seg_capacity_late <= 1e-9:
+                continue
+
+            add_late = min(residual_late, seg_capacity_late, suffix_slack_late)
+            if add_late <= 1e-9:
+                continue
+
+            dz_late[seg_idx] += add_late
+            residual_late -= add_late
+        return dz_late, residual_late
+
+    dz = dz_floor.copy()
+    residual = float(delta_z - np.sum(dz))
+    allocation_priority = np.maximum(weighted_dz - dz_floor, 1e-6)
+
+    for _ in range(48):
+        if residual <= 1e-6:
+            break
+
+        cum_drop = np.concatenate(([0.0], np.cumsum(dz)))
+        slack = max_drop_prefix - cum_drop
+        available = np.zeros_like(dz)
+
+        for seg_idx in range(len(dz)):
+            seg_capacity = float(dz_ceil[seg_idx] - dz[seg_idx])
+            if seg_capacity <= 1e-9:
+                continue
+            suffix_slack = (
+                float(np.min(slack[seg_idx + 1:]))
+                if seg_idx + 1 < len(slack) else float("inf")
+            )
+            available[seg_idx] = max(0.0, min(seg_capacity, suffix_slack))
+
+        if float(np.sum(available)) <= 1e-9:
+            break
+
+        weights = available * allocation_priority
+        if float(np.sum(weights)) <= 1e-9:
+            weights = available
+
+        delta = residual * (weights / max(float(np.sum(weights)), 1e-9))
+        delta = np.minimum(delta, available)
+        used = float(np.sum(delta))
+        if used <= 1e-9:
+            break
+        dz += delta
+        residual -= used
+
+    cum_drop = np.concatenate(([0.0], np.cumsum(dz)))
+    if residual > 0.5 or np.any(cum_drop - max_drop_prefix > 0.5):
+        dz, residual = late_allocate()
+
+    if residual > 0.5:
+        if allow_terminal_extension:
+            extra_length = max(residual * max(g_min, 1.0) * 1.15, 15.0)
+            extended_points_2d = _append_terminal_loiter(
+                points_2d,
+                extra_length,
+                postprocessor.min_turn_radius,
+                end_heading,
+            )
+            return _redistribute_altitude_with_clearance(
+                postprocessor,
+                extended_points_2d,
+                z_start,
+                z_goal,
+                profile=profile,
+                end_heading=end_heading,
+                allow_terminal_extension=False,
+                anchor_floors=anchor_floors,
+            )
+        raise ValueError("unable to allocate remaining altitude drop under clearance floors")
+
+    result = []
+    cum_drop = 0.0
+    for i in range(n_points):
+        z = z_start - cum_drop
+        result.append(np.array([points_2d[i][0], points_2d[i][1], z], dtype=np.float64))
+        if i < n_points - 1:
+            cum_drop += dz[i]
+    result[-1][2] = z_goal
+
+    for idx, point in enumerate(result):
+        if point[2] + 0.5 < clearance_floor[idx]:
+            raise ValueError("altitude redistribution violated obstacle clearance floor")
+
+    return result
+
+
+def _select_virtual_approach(self,
+                             desired_glide: float = 4.4,
+                             max_length: float = 240.0,
+                             min_length: float = 120.0) -> Optional[Dict[str, Any]]:
+    if self.map_manager is None or self.map_manager.target is None or self.map_manager.start is None:
+        return None
+
+    target = self.map_manager.target
+    target_pos = np.asarray(target.position, dtype=np.float64).copy()
+    available_altitude = max(float(self.map_manager.start.z - target_pos[2]), 1.0)
+    max_length = float(np.clip(max_length, 120.0, min(360.0, available_altitude * 0.90 * self.map_manager.constraints.glide_ratio)))
+    min_length = float(np.clip(min_length, 80.0, max_length))
+    approach_altitude = target_pos[2] + np.clip(
+        max_length / max(desired_glide, 1e-6),
+        max(45.0, self.map_manager.constraints.terminal_altitude),
+        min(140.0, available_altitude - 20.0)
+    )
+    if approach_altitude <= target_pos[2] + 5.0:
+        return None
+
+    approach_point, approach_heading, approach_length = self.map_manager.find_safe_approach_point(
+        target_pos=target_pos.copy(),
+        altitude=approach_altitude,
+        desired_heading=target.approach_heading,
+        max_length=max_length,
+        min_length=min_length,
+        heading_tolerance=target.approach_heading_tolerance,
+    )
+    if approach_point is None:
+        return None
+
+    return {
+        'point': np.asarray(approach_point, dtype=np.float64).copy(),
+        'heading': float(approach_heading),
+        'length': float(approach_length),
+        'target_position': target_pos.copy(),
+    }
+
+
+def _build_safe_approach_trajectory(self,
+                                    postprocessor: TrajectoryPostprocessor,
+                                    candidate_path: List[np.ndarray],
+                                    candidate_info: Dict[str, Any],
+                                    end_heading: Optional[float],
+                                    profile: str = "approach") -> Trajectory:
+    approach_info = candidate_info.get("virtual_approach")
+    if not approach_info:
+        raise ValueError("virtual approach info missing")
+
+    waypoints = [np.asarray(wp, dtype=np.float64) for wp in candidate_path]
+    if len(waypoints) < 2:
+        return Trajectory(dt=self.control_dt)
+
+    z_start = float(waypoints[0][2])
+    z_goal = float(approach_info["target_position"][2])
+    approach_xy = np.asarray(approach_info["point"][:2], dtype=np.float64)
+    target_xy = np.asarray(approach_info["target_position"][:2], dtype=np.float64)
+
+    points_2d = [wp[:2].copy() for wp in waypoints]
+    if np.linalg.norm(points_2d[-1] - approach_xy) > 1e-6:
+        points_2d.append(approach_xy.copy())
+
+    final_vec = target_xy - approach_xy
+    final_len = float(np.linalg.norm(final_vec))
+    if final_len > 1e-6:
+        n_final = max(4, int(np.ceil(final_len / 10.0)))
+        for k in range(1, n_final + 1):
+            frac = k / n_final
+            points_2d.append(approach_xy + frac * final_vec)
+
+    total_2d = sum(
+        np.linalg.norm(points_2d[i + 1] - points_2d[i])
+        for i in range(len(points_2d) - 1)
+    )
+    required_glide = total_2d / max(z_start - z_goal, 1e-6) if z_start > z_goal else float("inf")
+    trackable_min_glide = 5.0
+    if required_glide < trackable_min_glide - 0.05:
+        extra_length = (z_start - z_goal) * trackable_min_glide - total_2d
+        points_2d = _append_terminal_loiter(
+            points_2d,
+            extra_length,
+            postprocessor.min_turn_radius,
+            end_heading,
+        )
+
+    deduped_points = []
+    for pt in points_2d:
+        pt = np.asarray(pt, dtype=np.float64)
+        if not deduped_points or np.linalg.norm(pt - deduped_points[-1]) > 1e-6:
+            deduped_points.append(pt)
+
+    if len(deduped_points) < 2:
+        return Trajectory(dt=self.control_dt)
+
+    points_2d = postprocessor._resample_arc_length(deduped_points)
+    points_3d = _redistribute_altitude_with_clearance(
+        postprocessor,
+        points_2d,
+        z_start,
+        z_goal,
+        profile=profile,
+        end_heading=end_heading,
+        anchor_floors=[(approach_xy, float(approach_info["point"][2]))],
+    )
+    return postprocessor._create_trajectory(points_3d, end_heading)
+
+
+def _build_safe_tail_trajectory(self,
+                                postprocessor: TrajectoryPostprocessor,
+                                candidate_path: List[np.ndarray],
+                                candidate_info: Dict[str, Any],
+                                end_heading: Optional[float],
+                                profile: str = "approach") -> Trajectory:
+    approach_info = _select_virtual_approach(
+        self,
+        desired_glide=4.6,
+        max_length=260.0,
+        min_length=130.0,
+    )
+    if not approach_info:
+        raise ValueError("no safe approach available")
+
+    waypoints = [np.asarray(wp, dtype=np.float64) for wp in candidate_path]
+    if len(waypoints) < 3:
+        return Trajectory(dt=self.control_dt)
+
+    target_xy = np.asarray(approach_info["target_position"][:2], dtype=np.float64)
+    approach_xy = np.asarray(approach_info["point"][:2], dtype=np.float64)
+    approach_heading = float(approach_info["heading"])
+    r_min = float(postprocessor.min_turn_radius)
+
+    d_goal = np.array([
+        np.linalg.norm(wp[:2] - target_xy)
+        for wp in waypoints
+    ], dtype=np.float64)
+    desired_anchor_distance = float(approach_info["length"] + 0.75 * r_min)
+    candidate_indices = np.where(d_goal >= desired_anchor_distance)[0]
+    anchor_idx = int(candidate_indices[-1]) if len(candidate_indices) > 0 else max(0, len(waypoints) - 3)
+    anchor_idx = int(np.clip(anchor_idx, 0, len(waypoints) - 2))
+
+    anchor_xy = waypoints[anchor_idx][:2].copy()
+    if anchor_idx < len(waypoints) - 1:
+        anchor_dir = waypoints[anchor_idx + 1][:2] - waypoints[anchor_idx][:2]
+    else:
+        anchor_dir = waypoints[anchor_idx][:2] - waypoints[anchor_idx - 1][:2]
+    if np.linalg.norm(anchor_dir) < 1e-6:
+        anchor_heading = approach_heading
+    else:
+        anchor_heading = float(np.arctan2(anchor_dir[1], anchor_dir[0]))
+
+    transition_points = [anchor_xy.copy()]
+    dubins_path = postprocessor.dubins.compute(
+        (anchor_xy[0], anchor_xy[1], anchor_heading),
+        (approach_xy[0], approach_xy[1], approach_heading),
+    )
+    if dubins_path is not None:
+        sample_spacing = max(3.0, min(5.0, postprocessor.min_turn_radius / 30.0))
+        n_pts = int(np.clip(np.ceil(dubins_path['length'] / sample_spacing) + 1, 6, 240))
+        sampled = postprocessor.dubins.sample(dubins_path, num_points=n_pts)
+        transition_points = [np.array([pt[0], pt[1]], dtype=np.float64) for pt in sampled]
+    else:
+        connect_len = float(np.linalg.norm(approach_xy - anchor_xy))
+        n_connect = max(3, int(np.ceil(connect_len / 10.0)))
+        transition_points = [
+            anchor_xy + (k / n_connect) * (approach_xy - anchor_xy)
+            for k in range(n_connect + 1)
+        ]
+
+    final_vec = target_xy - approach_xy
+    final_len = float(np.linalg.norm(final_vec))
+    final_points = [approach_xy.copy()]
+    if final_len > 1e-6:
+        n_final = max(4, int(np.ceil(final_len / 10.0)))
+        final_points = [
+            approach_xy + (k / n_final) * final_vec
+            for k in range(n_final + 1)
+        ]
+
+    points_2d = [wp[:2].copy() for wp in waypoints[:anchor_idx + 1]]
+    points_2d.extend(transition_points[1:] if len(transition_points) > 1 else transition_points)
+    points_2d.extend(final_points[1:] if len(final_points) > 1 else final_points)
+
+    total_2d = sum(
+        np.linalg.norm(points_2d[i + 1] - points_2d[i])
+        for i in range(len(points_2d) - 1)
+    )
+    z_start = float(waypoints[0][2])
+    z_goal = float(self.map_manager.target.position[2]) if self.map_manager and self.map_manager.target else float(waypoints[-1][2])
+    required_glide = total_2d / max(z_start - z_goal, 1e-6) if z_start > z_goal else float("inf")
+    trackable_min_glide = 5.0
+    if required_glide < trackable_min_glide - 0.05:
+        extra_length = (z_start - z_goal) * trackable_min_glide - total_2d
+        points_2d = _append_terminal_loiter(
+            points_2d,
+            extra_length,
+            postprocessor.min_turn_radius,
+            end_heading,
+        )
+
+    deduped_points = []
+    for pt in points_2d:
+        pt = np.asarray(pt, dtype=np.float64)
+        if not deduped_points or np.linalg.norm(pt - deduped_points[-1]) > 1e-6:
+            deduped_points.append(pt)
+
+    points_2d = postprocessor._resample_arc_length(deduped_points)
+    points_3d = _redistribute_altitude_with_clearance(
+        postprocessor,
+        points_2d,
+        z_start,
+        z_goal,
+        profile=profile,
+        end_heading=end_heading,
+        anchor_floors=[(approach_xy, float(approach_info["point"][2]))],
+    )
+    return postprocessor._create_trajectory(points_3d, end_heading)
+
+
+def _sampled_collision_count(self, trajectory: Trajectory, sample_spacing: float = 5.0) -> int:
+    if self.map_manager is None or len(trajectory) == 0:
+        return 0
+
+    positions = trajectory.get_positions()
+    collisions = 0
+    for i in range(len(positions) - 1):
+        p0 = positions[i]
+        p1 = positions[i + 1]
+        seg_len = np.linalg.norm(p1 - p0)
+        n = max(1, int(np.ceil(seg_len / max(sample_spacing, 1e-6))))
+        for k in range(n + 1):
+            frac = k / n
+            sample = p0 + frac * (p1 - p0)
+            if self.map_manager.is_collision(sample):
+                collisions += 1
+                if collisions >= 3:
+                    return collisions
+    return collisions
+
+
+def _terminal_trackability_metrics(self, trajectory: Trajectory) -> Dict[str, float]:
+    if len(trajectory) < 3 or self.map_manager.target is None:
+        return {
+            'ok': True,
+            'last_turn_distance': float('inf'),
+            'tail_p05_radius': float('inf'),
+            'preferred_straight_tail': 0.0,
+        }
+
+    target_xy = self.map_manager.target.position[:2]
+    positions = trajectory.get_positions()
+    curvatures = trajectory.get_curvatures()
+    radii = trajectory.get_turning_radii()
+    d_goal = np.linalg.norm(positions[:, :2] - target_xy, axis=1)
+    min_turn_radius = self.map_manager.constraints.min_turn_radius
+
+    turn_threshold = 1.0 / max(2.5 * min_turn_radius, 1e-6)
+    turn_indices = np.where(np.abs(curvatures) > turn_threshold)[0]
+    last_turn_distance = float(d_goal[turn_indices[-1]]) if len(turn_indices) > 0 else float('inf')
+
+    tail_mask = d_goal <= max(150.0, 1.25 * min_turn_radius)
+    finite_tail_radii = radii[np.isfinite(radii) & tail_mask]
+    tail_p05_radius = (
+        float(np.percentile(finite_tail_radii, 5))
+        if len(finite_tail_radii) > 0 else float('inf')
+    )
+    preferred_straight_tail = float(max(120.0, 1.1 * min_turn_radius))
+
+    ok = (
+        last_turn_distance >= 0.85 * min_turn_radius and
+        tail_p05_radius >= 0.65 * min_turn_radius
+    )
+    return {
+        'ok': ok,
+        'last_turn_distance': last_turn_distance,
+        'tail_p05_radius': tail_p05_radius,
+        'preferred_straight_tail': preferred_straight_tail,
+    }
+
+
+def _vertical_trackability_metrics(self, trajectory: Trajectory) -> Dict[str, float]:
+    if len(trajectory) < 3:
+        return {'ok': True, 'mid_deficit': 0.0, 'late_deficit': 0.0, 'max_deficit': 0.0}
+
+    positions = trajectory.get_positions()
+    seg_lengths = np.linalg.norm(np.diff(positions[:, :2], axis=0), axis=1)
+    arc_lengths = np.concatenate(([0.0], np.cumsum(seg_lengths)))
+    total_arc = float(arc_lengths[-1])
+    total_drop = float(positions[0, 2] - positions[-1, 2])
+    if total_arc < 1e-6 or total_drop <= 1.0:
+        return {'ok': True, 'mid_deficit': 0.0, 'late_deficit': 0.0, 'max_deficit': 0.0}
+
+    conservative_glide = min(self.map_manager.constraints.glide_ratio * 0.9, 5.7)
+    consumed_drop = positions[0, 2] - positions[:, 2]
+    expected_min_drop = arc_lengths / max(conservative_glide, 1e-6)
+    deficits = np.maximum(expected_min_drop - consumed_drop, 0.0)
+
+    mid_idx = int(np.searchsorted(arc_lengths, 0.50 * total_arc, side='left'))
+    late_idx = int(np.searchsorted(arc_lengths, 0.75 * total_arc, side='left'))
+    mid_idx = int(np.clip(mid_idx, 0, len(deficits) - 1))
+    late_idx = int(np.clip(late_idx, 0, len(deficits) - 1))
+
+    mid_deficit = float(deficits[mid_idx])
+    late_deficit = float(deficits[late_idx])
+    max_deficit = float(np.max(deficits))
+    ok = mid_deficit <= 12.0 and late_deficit <= 20.0 and max_deficit <= 30.0
+
+    return {
+        'ok': ok,
+        'mid_deficit': mid_deficit,
+        'late_deficit': late_deficit,
+        'max_deficit': max_deficit,
+    }
+
+
+def _energy_trackability_metrics(self, trajectory: Trajectory) -> Dict[str, float]:
+    if len(trajectory) < 3:
+        return {
+            'ok': True,
+            'total_glide': 0.0,
+            'late_glide': 0.0,
+            'budget': float('inf'),
+            'late_glide_floor': 0.0,
+            'trackable_floor': 0.0,
+        }
+
+    positions = trajectory.get_positions()
+    seg_lengths = np.linalg.norm(np.diff(positions[:, :2], axis=0), axis=1)
+    arc_lengths = np.concatenate(([0.0], np.cumsum(seg_lengths)))
+    total_arc = float(arc_lengths[-1])
+    total_drop = float(positions[0, 2] - positions[-1, 2])
+    if total_arc < 1e-6 or total_drop <= 1.0:
+        return {
+            'ok': True,
+            'total_glide': 0.0,
+            'late_glide': 0.0,
+            'budget': float('inf'),
+            'late_glide_floor': 0.0,
+            'trackable_floor': 0.0,
+        }
+
+    trackable_budget = min(
+        self.map_manager.constraints.glide_ratio * 0.96,
+        self.map_manager.constraints.glide_ratio - 0.12,
+    )
+    total_glide = total_arc / max(total_drop, 1e-6)
+
+    late_start_idx = int(np.searchsorted(arc_lengths, 0.75 * total_arc, side='left'))
+    late_start_idx = int(np.clip(late_start_idx, 0, len(positions) - 1))
+    late_arc = float(total_arc - arc_lengths[late_start_idx])
+    late_drop = float(positions[late_start_idx, 2] - positions[-1, 2])
+    late_glide = late_arc / max(late_drop, 1e-6) if late_arc > 1.0 and late_drop > 0.5 else 0.0
+    trackable_floor = 5.0
+    late_glide_floor = max(self.map_manager.constraints.min_glide_ratio + 0.45, 3.25)
+
+    ok = total_glide <= trackable_budget + 1e-6
+    if late_glide > 0.0:
+        ok = ok and late_glide <= trackable_budget + 0.10
+
+    return {
+        'ok': ok,
+        'total_glide': float(total_glide),
+        'late_glide': float(late_glide),
+        'budget': float(trackable_budget),
+        'late_glide_floor': float(late_glide_floor),
+        'trackable_floor': float(trackable_floor),
+    }
+
+
+def _evaluate_trajectory_candidate(self, trajectory: Trajectory) -> Dict[str, Any]:
+    validation = validate_trajectory(
+        trajectory,
+        min_glide_ratio=self.map_manager.constraints.min_glide_ratio,
+        max_glide_ratio=self.map_manager.constraints.glide_ratio,
+        min_turn_radius=self.map_manager.constraints.min_turn_radius
+    )
+    collision_count = _sampled_collision_count(self, trajectory)
+    terminal_metrics = _terminal_trackability_metrics(self, trajectory)
+    vertical_metrics = _vertical_trackability_metrics(self, trajectory)
+    energy_metrics = _energy_trackability_metrics(self, trajectory)
+    target_z = (
+        float(self.map_manager.target.position[2])
+        if self.map_manager is not None and self.map_manager.target is not None
+        else 0.0
+    )
+    final_altitude_error = float(abs(trajectory.get_positions()[-1, 2] - target_z))
+    strict_valid = (
+        len(trajectory) > 0 and
+        validation.get('valid', False) and
+        collision_count == 0 and
+        terminal_metrics['ok'] and
+        energy_metrics['ok'] and
+        energy_metrics['total_glide'] >= energy_metrics['trackable_floor'] - 0.15 and
+        (
+            energy_metrics['late_glide'] <= 0.0 or
+            energy_metrics['late_glide'] >= energy_metrics['late_glide_floor'] - 0.10
+        ) and
+        final_altitude_error <= self.failure_detector.thresholds.landing_altitude
+    )
+    late_glide_penalty = 0.0
+    if energy_metrics['late_glide'] > 0.0:
+        late_glide_penalty = max(
+            0.0,
+            energy_metrics['late_glide_floor'] - energy_metrics['late_glide']
+        )
+    total_glide_floor_penalty = max(
+        0.0,
+        energy_metrics['trackable_floor'] - energy_metrics['total_glide']
+    )
+    score = (
+        1000 * len(validation.get('errors', [])) +
+        100 * collision_count +
+        2.0 * max(0.0, self.map_manager.constraints.min_turn_radius - terminal_metrics['tail_p05_radius']) +
+        3.0 * max(0.0, terminal_metrics['preferred_straight_tail'] - terminal_metrics['last_turn_distance']) +
+        40.0 * final_altitude_error +
+        280.0 * total_glide_floor_penalty +
+        500.0 * max(0.0, energy_metrics['total_glide'] - energy_metrics['budget']) +
+        350.0 * max(0.0, energy_metrics['late_glide'] - (energy_metrics['budget'] + 0.10)) +
+        220.0 * late_glide_penalty +
+        2.0 * vertical_metrics['mid_deficit'] +
+        3.0 * vertical_metrics['late_deficit'] +
+        4.0 * vertical_metrics['max_deficit']
+    )
+    return {
+        'strict_valid': strict_valid,
+        'validation': validation,
+        'collision_count': collision_count,
+        'terminal_metrics': terminal_metrics,
+        'vertical_metrics': vertical_metrics,
+        'energy_metrics': energy_metrics,
+        'final_altitude_error': final_altitude_error,
+        'score': score,
+    }
+
+def _plan_with_dynamic_retries(self,
+                               max_time: float = 30.0,
+                               smooth: bool = True,
+                               progress_callback: callable = None) -> bool:
+    """Retry planning until a dynamically feasible trajectory is found or budget is exhausted."""
+    if not self.quiet:
+        print("[3/4] planning Kinodynamic RRT* trajectory...")
+
+    plan_start_time = time.time()
+    planner_attempts = [
+        {"step_size": 100.0, "goal_sample_rate": 0.30, "max_iterations": 5000, "weight": 0.18},
+        {"step_size": 80.0, "goal_sample_rate": 0.40, "max_iterations": 7000, "weight": 0.18},
+        {"step_size": 140.0, "goal_sample_rate": 0.22, "max_iterations": 7000, "weight": 0.22},
+        {"step_size": 60.0, "goal_sample_rate": 0.45, "max_iterations": 9000, "weight": 0.18},
+        {"step_size": 120.0, "goal_sample_rate": 0.35, "max_iterations": 8000, "weight": 0.16},
+        {
+            "step_size": 90.0,
+            "goal_sample_rate": 0.36,
+            "max_iterations": 6500,
+            "weight": 0.08,
+            "use_virtual_approach": True,
+            "approach_glide": 4.2,
+            "approach_max_length": 220.0,
+            "approach_min_length": 110.0,
+        },
+    ]
+    postprocessor = TrajectoryPostprocessor(
+        reference_speed=self.reference_speed,
+        control_frequency=1.0 / self.control_dt,
+        min_turn_radius=self.map_manager.constraints.min_turn_radius,
+        max_glide_ratio=self.map_manager.constraints.glide_ratio,
+        min_glide_ratio=self.map_manager.constraints.min_glide_ratio,
+        map_manager=self.map_manager,
+        quiet=self.quiet
+    )
+
+    end_heading = self.map_manager.target.approach_heading if self.map_manager.target else None
+    path = None
+    info = {}
+    self.trajectory = None
+    best_grounded_fallback = None
+    best_grounded_fallback_score = float('inf')
+    best_loose_fallback = None
+    best_loose_fallback_score = float('inf')
+
+    for attempt_idx, planner_cfg in enumerate(planner_attempts, start=1):
+        remaining_time = max_time - (time.time() - plan_start_time)
+        if remaining_time <= 1.0:
+            break
+        remaining_weight = sum(
+            cfg.get("weight", 1.0) for cfg in planner_attempts[attempt_idx - 1:]
+        )
+        attempt_budget = min(
+            remaining_time,
+            max(
+                5.0,
+                remaining_time * planner_cfg.get("weight", 1.0) / max(remaining_weight, 1e-6),
+            )
+        )
+
+        if self.seed is not None:
+            np.random.seed(self.seed + 9973 * (attempt_idx - 1))
+
+        approach_info = None
+        if planner_cfg.get("use_virtual_approach"):
+            approach_info = _select_virtual_approach(
+                self,
+                desired_glide=planner_cfg.get("approach_glide", 4.4),
+                max_length=planner_cfg.get("approach_max_length", 240.0),
+                min_length=planner_cfg.get("approach_min_length", 120.0),
+            )
+
+        if not self.quiet:
+            attempt_desc = (
+                f"    [planning attempt {attempt_idx}/{len(planner_attempts)}] "
+                f"step={planner_cfg['step_size']:.0f}m, "
+                f"goal_rate={planner_cfg['goal_sample_rate']:.2f}, "
+                f"iter={planner_cfg['max_iterations']}, "
+                f"budget={attempt_budget:.1f}s"
+            )
+            if approach_info is not None:
+                attempt_desc += f", virtual_approach={approach_info['length']:.0f}m"
+            print(attempt_desc)
+
+        original_target = None
+        if approach_info is not None:
+            original_target = {
+                "position": self.map_manager.target.position.copy(),
+                "heading": float(self.map_manager.target.desired_approach_heading),
+            }
+            self.map_manager.target.position = approach_info["point"].copy()
+            self.map_manager.target.desired_approach_heading = float(approach_info["heading"])
+
+        try:
+            kino_planner = KinodynamicRRTStar(
+                self.map_manager,
+                quiet=self.quiet,
+                **{
+                    k: v for k, v in planner_cfg.items()
+                    if k not in {
+                        "weight",
+                        "use_virtual_approach",
+                        "approach_glide",
+                        "approach_max_length",
+                        "approach_min_length",
+                    }
+                }
+            )
+            candidate_path, candidate_info = kino_planner.plan(
+                max_time=attempt_budget,
+                progress_callback=progress_callback
+            )
+        finally:
+            if original_target is not None:
+                self.map_manager.target.position = original_target["position"]
+                self.map_manager.target.desired_approach_heading = original_target["heading"]
+
+        if candidate_path is None:
+            continue
+        candidate_info = dict(candidate_info)
+        if approach_info is not None:
+            candidate_info["virtual_approach"] = approach_info
+
+        if not self.quiet:
+            print("[4/4] trajectory postprocess + timing...")
+
+        if approach_info is not None:
+            candidate_builders = [
+                ("safe_approach", lambda: _build_safe_approach_trajectory(
+                    self, postprocessor, candidate_path, candidate_info, end_heading,
+                    profile="approach"
+                )),
+                ("safe_approach_front_loaded", lambda: _build_safe_approach_trajectory(
+                    self, postprocessor, candidate_path, candidate_info, end_heading,
+                    profile="front_loaded"
+                )),
+            ]
+        else:
+            candidate_builders = [
+                ("processed", lambda: postprocessor.process(
+                    candidate_path, smooth=smooth, end_heading=end_heading
+                )),
+                ("raw_edge", lambda: _build_raw_edge_trajectory(
+                    self, postprocessor, candidate_path, end_heading
+                )),
+                ("safe_tail", lambda: _build_safe_tail_trajectory(
+                    self, postprocessor, candidate_path, candidate_info, end_heading,
+                    profile="approach"
+                )),
+                ("junction_smoothed", lambda: _build_junction_smoothed_trajectory(
+                    self, postprocessor, candidate_path, candidate_info, end_heading
+                )),
+                ("front_loaded", lambda: _build_profiled_trajectory(
+                    self, postprocessor, candidate_path, candidate_info, end_heading,
+                    profile="front_loaded"
+                )),
+            ]
+
+        strict_choice = None
+
+        for candidate_name, builder in candidate_builders:
+            try:
+                candidate_traj = builder()
+            except Exception:
+                continue
+
+            if len(candidate_traj) == 0:
+                continue
+
+            evaluation = _evaluate_trajectory_candidate(self, candidate_traj)
+            if evaluation['strict_valid']:
+                if strict_choice is None or evaluation['score'] < strict_choice[2]['score']:
+                    strict_choice = (candidate_name, candidate_traj, evaluation)
+
+            if evaluation['collision_count'] == 0:
+                grounded = evaluation['final_altitude_error'] <= (
+                    self.failure_detector.thresholds.landing_altitude + 5.0
+                )
+                if grounded and evaluation['score'] < best_grounded_fallback_score:
+                    best_grounded_fallback = (
+                        candidate_path, candidate_info, candidate_traj, candidate_name, evaluation
+                    )
+                    best_grounded_fallback_score = evaluation['score']
+                elif (not grounded) and evaluation['score'] < best_loose_fallback_score:
+                    best_loose_fallback = (
+                        candidate_path, candidate_info, candidate_traj, candidate_name, evaluation
+                    )
+                    best_loose_fallback_score = evaluation['score']
+
+        if strict_choice is not None:
+            candidate_name, candidate_traj, evaluation = strict_choice
+            if not self.quiet:
+                print(
+                    f"    [select] using {candidate_name} trajectory "
+                    f"(vertical_deficit={evaluation['vertical_metrics']['max_deficit']:.1f}m, "
+                    f"total_glide={evaluation['energy_metrics']['total_glide']:.2f}, "
+                    f"final_alt_err={evaluation['final_altitude_error']:.1f}m)"
+                )
+            path = candidate_path
+            info = candidate_info
+            self.trajectory = candidate_traj
+            break
+
+        if not self.quiet:
+            print("    [replan] no trajectory candidate passed strict 3D/terminal screening")
+
+    self.planning_time = time.time() - plan_start_time
+
+    fallback_choice = best_grounded_fallback if best_grounded_fallback is not None else best_loose_fallback
+    if (path is None or self.trajectory is None) and fallback_choice is not None:
+        path, info, self.trajectory, candidate_name, evaluation = fallback_choice
+        if not self.quiet:
+            print(
+                f"    [fallback] using {candidate_name} trajectory "
+                f"(collisions={evaluation['collision_count']}, "
+                f"errors={len(evaluation['validation'].get('errors', []))}, "
+                f"final_alt_err={evaluation['final_altitude_error']:.1f}m)"
+            )
+
+    if path is None or self.trajectory is None:
+        if not self.quiet:
+            print("    planning failed!")
+        return False
+
+    if not self.quiet:
+        print(f"    planning complete: {len(path)} waypoints, time: {self.planning_time:.2f}s")
+        if 'path_length' in info:
+            print(f"    path length: {info['path_length']:.1f}m")
+        self._validate_trajectory_descent_rate()
+
+    self.controller.set_trajectory(self.trajectory)
+    return True
+
+
+KinodynamicRRTStar._obstacle_clearance_floor = _planner_obstacle_clearance_floor
+KinodynamicRRTStar._reassign_altitude = _planner_reassign_altitude_clearance_aware
+ClosedLoopSimulator.plan = _plan_with_dynamic_retries
+
+
 if __name__ == "__main__":
     import argparse
     from datetime import datetime
@@ -1406,6 +2727,9 @@ if __name__ == "__main__":
                         help="初始航向噪声 (rad)")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="输出目录（保存仿真数据 JSON，用于 Web 可视化），目录不存在会自动创建")
+    parser.add_argument("--controller", type=str, default="adrc",
+                        choices=["adrc", "pid"],
+                        help="controller type")
     parser.add_argument("--no-plot", action="store_true",
                         help="不显示 matplotlib 图表")
     args = parser.parse_args()
@@ -1415,7 +2739,8 @@ if __name__ == "__main__":
         map_config_path=args.map_config,
         model_config_path=args.model_config,
         control_dt=args.control_dt,
-        dynamics_dt=args.dynamics_dt
+        dynamics_dt=args.dynamics_dt,
+        controller_type=args.controller
     )
 
     # 规划

@@ -505,6 +505,17 @@ class ControlOutput:
     ref_position_closest: np.ndarray = field(default_factory=lambda: np.zeros(3))
 
 
+@dataclass
+class GuidancePoint:
+    """Interpolated trajectory point used by the shared guidance layer."""
+    index: int = 0
+    s: float = 0.0
+    alpha: float = 0.0
+    position: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    heading: float = 0.0
+    curvature: float = 0.0
+
+
 class ParafoilADRCController:
     """
     翼伞ADRC轨迹跟踪控制器
@@ -533,6 +544,15 @@ class ParafoilADRCController:
                  reference_speed: float = 12.0,
                  min_turn_radius: float = 50.0,
                  lookahead_distance: float = 50.0,
+                 lookahead_min_distance: float = 35.0,
+                 lookahead_max_distance: float = 120.0,
+                 lookahead_error_scale: float = 0.012,
+                 closest_search_window: int = 80,
+                 closest_reacquire_distance: float = 45.0,
+                 closest_reacquire_window: int = 600,
+                 closest_backtrack_window: int = 6,
+                 cross_track_softening: float = 6.0,
+                 max_cross_track_heading_correction: float = np.radians(30.0),
                  # 输出限制
                  max_deflection: float = 1.0,
                  dt: float = 0.01):
@@ -558,6 +578,20 @@ class ParafoilADRCController:
         self.reference_speed = reference_speed
         self.min_turn_radius = min_turn_radius
         self.lookahead_distance = lookahead_distance
+        self.lookahead_min_distance = min(lookahead_min_distance, lookahead_max_distance)
+        self.lookahead_max_distance = max(lookahead_min_distance, lookahead_max_distance)
+        self.lookahead_error_scale = max(0.0, lookahead_error_scale)
+        self.closest_search_window = max(10, int(closest_search_window))
+        self.closest_reacquire_distance = max(1.0, closest_reacquire_distance)
+        self.closest_reacquire_window = max(
+            self.closest_search_window,
+            int(closest_reacquire_window)
+        )
+        self.closest_backtrack_window = max(0, int(closest_backtrack_window))
+        self.cross_track_softening = max(0.1, cross_track_softening)
+        self.max_cross_track_heading_correction = abs(
+            max_cross_track_heading_correction
+        )
         self.max_deflection = max_deflection
         self.dt = dt
 
@@ -593,7 +627,14 @@ class ParafoilADRCController:
         # 轨迹跟踪状态
         self.trajectory = None
         self.current_index = 0
+        self.current_progress_s = 0.0
         self.last_heading_ref = None
+        self._trajectory_positions = np.zeros((0, 3))
+        self._trajectory_xy = np.zeros((0, 2))
+        self._trajectory_headings = np.zeros(0)
+        self._trajectory_curvatures = np.zeros(0)
+        self._trajectory_segment_lengths = np.zeros(0)
+        self._trajectory_arc_lengths = np.zeros(0)
         
         # 调试模式
         self.debug = False
@@ -607,7 +648,7 @@ class ParafoilADRCController:
             trajectory: Trajectory 对象 (来自 planning.trajectory)
         """
         self.trajectory = trajectory
-        self.current_index = 0
+        self._build_trajectory_cache()
         self.reset()
     
     def reset(self):
@@ -615,12 +656,156 @@ class ParafoilADRCController:
         self.heading_adrc.reset()
         self.lateral_error_last = 0.0
         self.current_index = 0
+        self.current_progress_s = 0.0
         self.last_heading_ref = None
         self.debug_counter = 0
     
     def set_debug(self, enabled: bool = True):
         """启用/禁用调试模式"""
         self.debug = enabled
+
+    def _build_trajectory_cache(self):
+        """Pre-compute arrays used by the shared guidance layer."""
+        if self.trajectory is None or len(self.trajectory) == 0:
+            self._trajectory_positions = np.zeros((0, 3))
+            self._trajectory_xy = np.zeros((0, 2))
+            self._trajectory_headings = np.zeros(0)
+            self._trajectory_curvatures = np.zeros(0)
+            self._trajectory_segment_lengths = np.zeros(0)
+            self._trajectory_arc_lengths = np.zeros(0)
+            return
+
+        self._trajectory_positions = np.array(
+            [pt.position for pt in self.trajectory],
+            dtype=float,
+        )
+        self._trajectory_xy = self._trajectory_positions[:, :2]
+        self._trajectory_headings = np.array(
+            [pt.heading for pt in self.trajectory],
+            dtype=float,
+        )
+        self._trajectory_curvatures = np.array(
+            [pt.curvature for pt in self.trajectory],
+            dtype=float,
+        )
+
+        if len(self.trajectory) > 1:
+            diffs = np.diff(self._trajectory_xy, axis=0)
+            self._trajectory_segment_lengths = np.linalg.norm(diffs, axis=1)
+            self._trajectory_arc_lengths = np.concatenate((
+                [0.0],
+                np.cumsum(self._trajectory_segment_lengths),
+            ))
+        else:
+            self._trajectory_segment_lengths = np.zeros(0)
+            self._trajectory_arc_lengths = np.zeros(1)
+
+    def _sample_guidance_point(self, s: float) -> GuidancePoint:
+        """Sample an interpolated point along the trajectory arc length."""
+        if self.trajectory is None or len(self.trajectory) == 0:
+            return GuidancePoint()
+
+        if len(self.trajectory) == 1:
+            pt = self.trajectory[0]
+            return GuidancePoint(
+                index=0,
+                s=0.0,
+                alpha=0.0,
+                position=pt.position.copy(),
+                heading=pt.heading,
+                curvature=pt.curvature,
+            )
+
+        s = float(np.clip(s, 0.0, self._trajectory_arc_lengths[-1]))
+        if s >= self._trajectory_arc_lengths[-1]:
+            pt = self.trajectory[-1]
+            return GuidancePoint(
+                index=len(self.trajectory) - 1,
+                s=self._trajectory_arc_lengths[-1],
+                alpha=0.0,
+                position=pt.position.copy(),
+                heading=pt.heading,
+                curvature=pt.curvature,
+            )
+
+        idx = int(np.searchsorted(self._trajectory_arc_lengths, s, side='right') - 1)
+        idx = int(np.clip(idx, 0, len(self.trajectory) - 2))
+        s0 = self._trajectory_arc_lengths[idx]
+        seg_len = self._trajectory_segment_lengths[idx]
+        alpha = 0.0 if seg_len <= 1e-6 else float(np.clip((s - s0) / seg_len, 0.0, 1.0))
+
+        position = (
+            self._trajectory_positions[idx]
+            + alpha * (self._trajectory_positions[idx + 1] - self._trajectory_positions[idx])
+        )
+        heading = self._wrap_angle(
+            self._trajectory_headings[idx]
+            + alpha * self._wrap_angle(
+                self._trajectory_headings[idx + 1] - self._trajectory_headings[idx]
+            )
+        )
+        curvature = (
+            self._trajectory_curvatures[idx]
+            + alpha * (self._trajectory_curvatures[idx + 1] - self._trajectory_curvatures[idx])
+        )
+        return GuidancePoint(
+            index=idx,
+            s=s,
+            alpha=alpha,
+            position=position,
+            heading=heading,
+            curvature=curvature,
+        )
+
+    def _search_projection_window(
+        self,
+        current_xy: np.ndarray,
+        start_idx: int,
+        end_idx: int,
+    ) -> Tuple[GuidancePoint, float]:
+        """Find the closest projected point on a local trajectory window."""
+        if self.trajectory is None or len(self.trajectory) == 0:
+            return GuidancePoint(), np.inf
+
+        n_points = len(self.trajectory)
+        if n_points == 1:
+            point = self._sample_guidance_point(0.0)
+            return point, float(np.linalg.norm(current_xy - point.position[:2]))
+
+        start_idx = int(np.clip(start_idx, 0, n_points - 1))
+        end_idx = int(np.clip(end_idx, 0, n_points - 1))
+        if end_idx < start_idx:
+            end_idx = start_idx
+
+        best_point = self._sample_guidance_point(self.current_progress_s)
+        best_dist = float(np.linalg.norm(current_xy - best_point.position[:2]))
+
+        for idx in {start_idx, end_idx}:
+            point = self._sample_guidance_point(self._trajectory_arc_lengths[idx])
+            dist = float(np.linalg.norm(current_xy - point.position[:2]))
+            if dist < best_dist:
+                best_dist = dist
+                best_point = point
+
+        for idx in range(start_idx, end_idx):
+            p0 = self._trajectory_xy[idx]
+            p1 = self._trajectory_xy[idx + 1]
+            seg = p1 - p0
+            seg_len_sq = float(np.dot(seg, seg))
+            if seg_len_sq <= 1e-10:
+                alpha = 0.0
+                proj_xy = p0
+            else:
+                alpha = float(np.clip(np.dot(current_xy - p0, seg) / seg_len_sq, 0.0, 1.0))
+                proj_xy = p0 + alpha * seg
+
+            dist = float(np.linalg.norm(current_xy - proj_xy))
+            if dist < best_dist:
+                s = self._trajectory_arc_lengths[idx] + alpha * self._trajectory_segment_lengths[idx]
+                best_dist = dist
+                best_point = self._sample_guidance_point(s)
+
+        return best_point, best_dist
 
     def compute_symmetric_deflection(self,
                                       current_pos: np.ndarray,
@@ -702,7 +887,7 @@ class ParafoilADRCController:
 
         return delta_s, glide_ratio_required, glide_ratio_current
     
-    def _find_closest_point(self, current_pos: np.ndarray) -> int:
+    def _find_closest_point_legacy_unused(self, current_pos: np.ndarray) -> GuidancePoint:
         """
         找到轨迹上距离当前位置最近的点索引 (2D水平面距离)
 
@@ -711,7 +896,7 @@ class ParafoilADRCController:
         2. 若距离 >30m，扩大搜索范围 → 处理初始偏差和大扰动
         """
         if self.trajectory is None or len(self.trajectory) == 0:
-            return 0
+            return GuidancePoint()
 
         # Phase 1: 小窗口搜索（基于速度的期望前进量）
         expected_next = self.current_index + 1
@@ -743,8 +928,75 @@ class ParafoilADRCController:
         best_idx = max(best_idx, self.current_index)
 
         return best_idx
+
+    def _find_closest_point(self, current_pos: np.ndarray) -> GuidancePoint:
+        """Project the vehicle onto nearby trajectory segments."""
+        if self.trajectory is None or len(self.trajectory) == 0:
+            return GuidancePoint()
+
+        current_xy = current_pos[:2]
+        search_start = max(0, self.current_index - self.closest_backtrack_window)
+        search_end = min(
+            len(self.trajectory) - 1,
+            self.current_index + self.closest_search_window,
+        )
+        best_point, best_dist = self._search_projection_window(
+            current_xy,
+            search_start,
+            search_end,
+        )
+
+        if best_dist > self.closest_reacquire_distance:
+            reacquire_end = min(
+                len(self.trajectory) - 1,
+                self.current_index + self.closest_reacquire_window,
+            )
+            candidate_point, candidate_dist = self._search_projection_window(
+                current_xy,
+                search_start,
+                reacquire_end,
+            )
+            if candidate_dist < best_dist:
+                best_point = candidate_point
+                best_dist = candidate_dist
+
+        if best_dist > self.closest_reacquire_distance * 1.5:
+            candidate_point, candidate_dist = self._search_projection_window(
+                current_xy,
+                0,
+                len(self.trajectory) - 1,
+            )
+            if candidate_dist + 1e-6 < best_dist:
+                best_point = candidate_point
+
+        if self._trajectory_arc_lengths.size > 0:
+            min_idx = max(0, self.current_index - self.closest_backtrack_window)
+            min_s = self._trajectory_arc_lengths[min_idx]
+            if best_point.s < min_s:
+                best_point = self._sample_guidance_point(min_s)
+
+        self.current_progress_s = best_point.s
+        if self._trajectory_arc_lengths.size > 0:
+            self.current_index = int(np.searchsorted(
+                self._trajectory_arc_lengths,
+                best_point.s,
+                side='right',
+            ) - 1)
+            self.current_index = int(np.clip(
+                self.current_index,
+                0,
+                len(self.trajectory) - 1,
+            ))
+        else:
+            self.current_index = 0
+
+        return best_point
     
-    def _find_lookahead_point(self, current_pos: np.ndarray, closest_idx: int):
+    def _find_lookahead_point(
+        self,
+        closest_point: GuidancePoint,
+        cross_track_error: float = 0.0
+    ) -> GuidancePoint:
         """
         找到前视点 (Pure Pursuit风格，自适应前视距离)
 
@@ -752,7 +1004,23 @@ class ParafoilADRCController:
         直线段使用标称前视距离以保持平滑性。
         """
         if self.trajectory is None or len(self.trajectory) == 0:
-            return None
+            return GuidancePoint()
+
+        curvature = abs(closest_point.curvature)
+        if curvature > 1e-3:
+            curve_scale = max(0.45, 1.0 - min(curvature * self.min_turn_radius, 0.55))
+        else:
+            curve_scale = 1.0
+
+        error_scale = 1.0 / (1.0 + self.lookahead_error_scale * abs(cross_track_error))
+        effective_la = self.lookahead_distance * curve_scale * error_scale
+        effective_la = float(np.clip(
+            effective_la,
+            self.lookahead_min_distance,
+            self.lookahead_max_distance
+        ))
+
+        return self._sample_guidance_point(closest_point.s + effective_la)
 
         # 自适应前视距离：基于最近点的曲率
         # Pure Pursuit 理论：弯道时应缩短前视距离以减少切弯误差
@@ -785,7 +1053,8 @@ class ParafoilADRCController:
     def compute_control(self, 
                         current_pos: np.ndarray,
                         current_heading: float,
-                        current_heading_rate: float = 0.0) -> ControlOutput:
+                        current_heading_rate: float = 0.0,
+                        current_speed: Optional[float] = None) -> ControlOutput:
         """
         计算控制输出 (基于已设置的轨迹)
         
@@ -801,6 +1070,93 @@ class ParafoilADRCController:
         
         if self.trajectory is None or len(self.trajectory) == 0:
             return output
+
+        closest_point = self._find_closest_point(current_pos)
+        ref_dir = np.array([np.cos(closest_point.heading), np.sin(closest_point.heading)])
+        to_vehicle = current_pos[:2] - closest_point.position[:2]
+        cross_track_error = ref_dir[0] * to_vehicle[1] - ref_dir[1] * to_vehicle[0]
+        along_track_error = np.dot(to_vehicle, ref_dir)
+
+        lookahead_point = self._find_lookahead_point(
+            closest_point,
+            cross_track_error=cross_track_error
+        )
+        dx = lookahead_point.position[0] - current_pos[0]
+        dy = lookahead_point.position[1] - current_pos[1]
+        dist_to_lookahead = np.sqrt(dx**2 + dy**2)
+
+        if dist_to_lookahead > 1.0:
+            los_heading = np.arctan2(dy, dx)
+        else:
+            los_heading = closest_point.heading
+
+        speed_for_guidance = max(
+            current_speed if current_speed is not None else self.reference_speed,
+            0.1
+        )
+        cross_track_rate = (cross_track_error - self.lateral_error_last) / max(self.dt, 1e-6)
+        self.lateral_error_last = cross_track_error
+
+        heading_correction = -np.arctan2(
+            self.lateral_kp * cross_track_error,
+            speed_for_guidance + self.cross_track_softening
+        )
+        heading_correction -= self.lateral_kd * cross_track_rate
+        heading_correction = float(np.clip(
+            heading_correction,
+            -self.max_cross_track_heading_correction,
+            self.max_cross_track_heading_correction
+        ))
+        target_heading = self._wrap_angle(los_heading + heading_correction)
+
+        output.ref_position = closest_point.position.copy()
+        output.ref_position_closest = closest_point.position.copy()
+        output.ref_heading = target_heading
+        output.heading_error = self._wrap_angle(target_heading - current_heading)
+        output.altitude_error = closest_point.position[2] - current_pos[2]
+        output.cross_track_error = cross_track_error
+        output.along_track_error = along_track_error
+
+        adjusted_heading_ref = target_heading
+        adjusted_error = self._wrap_angle(adjusted_heading_ref - current_heading)
+        if abs(adjusted_error) > np.radians(60):
+            adjusted_heading_ref = (
+                current_heading
+                + np.sign(adjusted_error) * np.radians(60)
+            )
+        adjusted_heading_ref = self._wrap_angle(adjusted_heading_ref)
+
+        delta_diff = self.heading_adrc.update(adjusted_heading_ref, current_heading, self.dt)
+        output.delta_asymmetric = delta_diff
+
+        if delta_diff > 0:
+            delta_right_heading = delta_diff
+            delta_left_heading = 0.0
+        elif delta_diff < 0:
+            delta_left_heading = -delta_diff
+            delta_right_heading = 0.0
+        else:
+            delta_left_heading = 0.0
+            delta_right_heading = 0.0
+
+        delta_left = np.clip(delta_left_heading, 0, self.max_deflection)
+        delta_right = np.clip(delta_right_heading, 0, self.max_deflection)
+        output.delta_left = delta_left
+        output.delta_right = delta_right
+
+        if self.debug and self.debug_counter % 100 == 0:
+            print(f"[鎺у埗鍣ㄨ皟璇昡 step={self.debug_counter}")
+            print(f"  褰撳墠浣嶇疆: ({current_pos[0]:.1f}, {current_pos[1]:.1f}, {current_pos[2]:.1f})")
+            print(f"  褰撳墠鑸悜: {np.degrees(current_heading):.1f}掳")
+            print(f"  瀵煎紩鑸悜: {np.degrees(target_heading):.1f}掳")
+            print(f"  鑸悜璇樊: {np.degrees(output.heading_error):.1f}掳")
+            print(f"  妯悜璇樊: {cross_track_error:.2f}m")
+            print(f"  妯悜淇: {np.degrees(heading_correction):.1f}掳")
+            print(f"  鎺у埗杈撳嚭: {delta_diff:.3f}")
+            print(f"  宸︾怀: {delta_left:.3f}, 鍙崇怀: {delta_right:.3f}")
+
+        self.debug_counter += 1
+        return output
         
         # ========== 1. 找到轨迹上的参考点 ==========
         self.current_index = self._find_closest_point(current_pos)
@@ -942,7 +1298,8 @@ class ParafoilADRCController:
         output = self.compute_control(
             current_pos=current_pos,
             current_heading=current_heading,
-            current_heading_rate=heading_rate
+            current_heading_rate=heading_rate,
+            current_speed=current_speed
         )
 
         # 2. 计算下降率控制 (对称偏转)
@@ -1052,3 +1409,368 @@ class ParafoilADRCController:
         while angle < -np.pi:
             angle += 2 * np.pi
         return angle
+def _compute_symmetric_deflection_trackable(self,
+                                            current_pos: np.ndarray,
+                                            current_vel: np.ndarray,
+                                            target_pos: np.ndarray) -> Tuple[float, float, float]:
+    if self.trajectory is None or len(self.trajectory) == 0:
+        return 0.0, 0.0, 0.0
+
+    v_horizontal = np.sqrt(current_vel[0]**2 + current_vel[1]**2)
+    v_vertical = -current_vel[2]
+    if v_vertical > 0.1:
+        glide_ratio_current = v_horizontal / v_vertical
+    else:
+        glide_ratio_current = self.glide_ratio_natural
+
+    altitude_error = current_pos[2] - target_pos[2]
+    remaining_xy = float(np.linalg.norm(self.trajectory[-1].position[:2] - current_pos[:2]))
+    altitude_deadband = float(np.clip(0.03 * remaining_xy, 5.0, 22.0))
+    effective_altitude_error = altitude_error - altitude_deadband
+
+    if effective_altitude_error <= 0.0:
+        glide_ratio_required = min(
+            self.glide_ratio_natural * 1.05,
+            self.glide_ratio_natural + abs(effective_altitude_error) / 18.0
+        )
+    else:
+        glide_ratio_required = self.glide_ratio_natural - effective_altitude_error / 10.0
+
+    glide_ratio_required = float(np.clip(
+        glide_ratio_required,
+        self.glide_ratio_min,
+        self.glide_ratio_natural * 1.1
+    ))
+    glide_ratio_target = glide_ratio_required / max(self.descent_margin, 1e-6)
+
+    if glide_ratio_target >= self.glide_ratio_natural:
+        delta_s = 0.0
+    elif glide_ratio_target <= self.glide_ratio_min:
+        delta_s = self.max_deflection
+    else:
+        ratio = (self.glide_ratio_natural - glide_ratio_target) / \
+                (self.glide_ratio_natural - self.glide_ratio_min)
+        delta_s = ratio * self.max_deflection
+
+    glide_error = glide_ratio_current - glide_ratio_target
+    delta_s_feedback = self.descent_kp * glide_error * 0.05
+
+    progress = self.get_progress()
+    if progress > 0.95:
+        delta_s_cap = 0.55 * self.max_deflection
+    elif progress > 0.80:
+        delta_s_cap = 0.32 * self.max_deflection
+    elif progress > 0.55:
+        delta_s_cap = 0.18 * self.max_deflection
+    else:
+        delta_s_cap = 0.08 * self.max_deflection
+
+    if effective_altitude_error <= 0.0:
+        delta_s = 0.0
+    delta_s = np.clip(delta_s + delta_s_feedback, 0, min(self.max_deflection, delta_s_cap))
+
+    return float(delta_s), glide_ratio_required, glide_ratio_current
+
+
+def _update_trackable(self,
+                      current_pos: np.ndarray,
+                      current_vel: np.ndarray,
+                      current_heading: float,
+                      t: float = None) -> ControlOutput:
+    current_speed = np.linalg.norm(current_vel[:2])
+    heading_rate = 0.0
+
+    output = self.compute_control(
+        current_pos=current_pos,
+        current_heading=current_heading,
+        current_heading_rate=heading_rate,
+        current_speed=current_speed
+    )
+
+    target_pos = output.ref_position_closest
+    delta_s, glide_required, glide_current = self.compute_symmetric_deflection(
+        current_pos=current_pos,
+        current_vel=current_vel,
+        target_pos=target_pos
+    )
+
+    delta_a = output.delta_asymmetric
+    delta_a_abs = abs(delta_a)
+
+    progress = self.get_progress()
+    if progress > 0.95:
+        budget_ratio = 0.38
+    elif progress > 0.8:
+        budget_ratio = 0.24
+    elif progress > 0.5:
+        budget_ratio = 0.12
+    else:
+        budget_ratio = 0.04
+
+    min_symmetric_budget = budget_ratio * self.max_deflection
+    max_asymmetric = self.max_deflection - min_symmetric_budget
+    delta_a_abs = min(delta_a_abs, max_asymmetric)
+    delta_a = np.sign(delta_a) * delta_a_abs if delta_a != 0 else 0.0
+    output.delta_asymmetric = delta_a
+
+    max_symmetric = self.max_deflection - delta_a_abs
+    delta_s_limited = np.clip(delta_s, 0, max(0, max_symmetric))
+    output.delta_symmetric = delta_s_limited
+
+    if delta_a >= 0:
+        delta_left = delta_s_limited
+        delta_right = delta_s_limited + delta_a
+    else:
+        delta_left = delta_s_limited - delta_a
+        delta_right = delta_s_limited
+
+    delta_left = np.clip(delta_left, 0, self.max_deflection)
+    delta_right = np.clip(delta_right, 0, self.max_deflection)
+    output.delta_left = delta_left
+    output.delta_right = delta_right
+
+    if self.debug and self.debug_counter % 100 == 1:
+        print(f"  [trackable-descent] d_s_req={delta_s:.3f}, d_s_used={delta_s_limited:.3f}")
+        print(f"    glide req: {glide_required:.1f}, current: {glide_current:.1f}")
+        print(f"    d_a={delta_a:.3f}, final L={delta_left:.3f}, R={delta_right:.3f}")
+
+    return output
+
+
+ParafoilADRCController.compute_symmetric_deflection = _compute_symmetric_deflection_trackable
+ParafoilADRCController.update = _update_trackable
+
+
+def _compute_symmetric_deflection_energy_guided(self,
+                                                current_pos: np.ndarray,
+                                                current_vel: np.ndarray,
+                                                target_pos: np.ndarray) -> Tuple[float, float, float]:
+    if self.trajectory is None or len(self.trajectory) == 0:
+        return 0.0, 0.0, 0.0
+
+    v_horizontal = np.sqrt(current_vel[0]**2 + current_vel[1]**2)
+    v_vertical = -current_vel[2]
+    if v_vertical > 0.1:
+        glide_ratio_current = v_horizontal / v_vertical
+    else:
+        glide_ratio_current = self.glide_ratio_natural
+
+    final_pos = self.trajectory[-1].position
+    total_arc = float(self._trajectory_arc_lengths[-1]) if self._trajectory_arc_lengths.size > 0 else 0.0
+    remaining_arc = max(total_arc - float(self.current_progress_s), 1.0)
+    remaining_drop = max(float(current_pos[2] - final_pos[2]), 1.0)
+    dist_to_goal = float(np.linalg.norm(current_pos[:2] - final_pos[:2]))
+    if remaining_arc < 1.0 and dist_to_goal < 0.85 * self.min_turn_radius and remaining_drop > 25.0:
+        remaining_arc = max(remaining_arc, 2.0 * np.pi * 1.1 * self.min_turn_radius)
+    remaining_glide_required = remaining_arc / remaining_drop
+
+    local_altitude_error = float(current_pos[2] - target_pos[2])
+    local_deadband = float(np.clip(0.015 * remaining_arc, 4.0, 18.0))
+    local_glide_required = self.glide_ratio_natural - (local_altitude_error - local_deadband) / 8.5
+
+    progress = self.get_progress()
+    blend = float(np.clip(0.40 + 0.35 * progress, 0.40, 0.78))
+    glide_ratio_required = (
+        (1.0 - blend) * local_glide_required
+        + blend * remaining_glide_required
+    )
+
+    if progress > 0.82 and local_altitude_error > 6.0:
+        glide_ratio_required = min(
+            glide_ratio_required,
+            self.glide_ratio_natural - local_altitude_error / 7.0
+        )
+
+    glide_ratio_required = np.clip(
+        glide_ratio_required,
+        self.glide_ratio_min + 0.02,
+        self.glide_ratio_natural * 1.08
+    )
+    glide_ratio_target = glide_ratio_required / max(self.descent_margin, 1e-6)
+
+    if glide_ratio_target >= self.glide_ratio_natural:
+        delta_s = 0.0
+    elif glide_ratio_target <= self.glide_ratio_min:
+        delta_s = self.max_deflection
+    else:
+        ratio = (self.glide_ratio_natural - glide_ratio_target) / \
+            (self.glide_ratio_natural - self.glide_ratio_min)
+        delta_s = ratio * self.max_deflection
+
+    glide_error = glide_ratio_current - glide_ratio_target
+    delta_s_feedback = self.descent_kp * glide_error * 0.10
+    if local_altitude_error > 0.0:
+        delta_s_feedback += min(0.10, 0.0035 * local_altitude_error)
+    elif local_altitude_error < -8.0:
+        delta_s_feedback -= min(0.08, 0.0025 * abs(local_altitude_error))
+
+    if progress > 0.95:
+        delta_s_cap = 0.58 * self.max_deflection
+    elif progress > 0.82:
+        delta_s_cap = 0.40 * self.max_deflection
+    elif progress > 0.55:
+        delta_s_cap = 0.24 * self.max_deflection
+    else:
+        delta_s_cap = 0.12 * self.max_deflection
+
+    if glide_ratio_target >= self.glide_ratio_natural and local_altitude_error <= 0.0:
+        delta_s = 0.0
+    delta_s = np.clip(delta_s + delta_s_feedback, 0, min(self.max_deflection, delta_s_cap))
+
+    return float(delta_s), float(glide_ratio_required), float(glide_ratio_current)
+
+
+def _update_energy_guided(self,
+                          current_pos: np.ndarray,
+                          current_vel: np.ndarray,
+                          current_heading: float,
+                          t: float = None) -> ControlOutput:
+    current_speed = np.linalg.norm(current_vel[:2])
+    heading_rate = 0.0
+
+    output = self.compute_control(
+        current_pos=current_pos,
+        current_heading=current_heading,
+        current_heading_rate=heading_rate,
+        current_speed=current_speed
+    )
+
+    target_pos = output.ref_position_closest
+    delta_s, glide_required, glide_current = self.compute_symmetric_deflection(
+        current_pos=current_pos,
+        current_vel=current_vel,
+        target_pos=target_pos
+    )
+
+    delta_a = output.delta_asymmetric
+    delta_a_abs = abs(delta_a)
+
+    progress = self.get_progress()
+    if progress > 0.95:
+        budget_ratio = 0.52
+    elif progress > 0.82:
+        budget_ratio = 0.34
+    elif progress > 0.55:
+        budget_ratio = 0.18
+    else:
+        budget_ratio = 0.08
+
+    min_symmetric_budget = budget_ratio * self.max_deflection
+    max_asymmetric = self.max_deflection - min_symmetric_budget
+    delta_a_abs = min(delta_a_abs, max_asymmetric)
+    delta_a = np.sign(delta_a) * delta_a_abs if delta_a != 0 else 0.0
+    output.delta_asymmetric = delta_a
+
+    max_symmetric = self.max_deflection - delta_a_abs
+    delta_s_limited = np.clip(delta_s, 0, max(0, max_symmetric))
+    output.delta_symmetric = delta_s_limited
+
+    if delta_a >= 0:
+        delta_left = delta_s_limited
+        delta_right = delta_s_limited + delta_a
+    else:
+        delta_left = delta_s_limited - delta_a
+        delta_right = delta_s_limited
+
+    delta_left = np.clip(delta_left, 0, self.max_deflection)
+    delta_right = np.clip(delta_right, 0, self.max_deflection)
+    output.delta_left = delta_left
+    output.delta_right = delta_right
+
+    if self.debug and self.debug_counter % 100 == 1:
+        print(f"  [energy-guided-descent] d_s_req={delta_s:.3f}, d_s_used={delta_s_limited:.3f}")
+        print(f"    glide req: {glide_required:.1f}, current: {glide_current:.1f}")
+        print(f"    d_a={delta_a:.3f}, final L={delta_left:.3f}, R={delta_right:.3f}")
+
+    return output
+
+
+ParafoilADRCController.compute_symmetric_deflection = _compute_symmetric_deflection_energy_guided
+ParafoilADRCController.update = _update_energy_guided
+
+
+_ORIGINAL_COMPUTE_CONTROL = ParafoilADRCController.compute_control
+
+
+def _compute_control_with_terminal_loiter(self,
+                                          current_pos: np.ndarray,
+                                          current_heading: float,
+                                          current_heading_rate: float = 0.0,
+                                          current_speed: Optional[float] = None) -> ControlOutput:
+    if self.trajectory is None or len(self.trajectory) == 0:
+        return ControlOutput()
+
+    final_pos = self.trajectory[-1].position
+    goal_xy = final_pos[:2]
+    dist_to_goal = float(np.linalg.norm(current_pos[:2] - goal_xy))
+    alt_above_goal = float(current_pos[2] - final_pos[2])
+    loiter_radius = max(1.05 * self.min_turn_radius, 95.0)
+    loiter_entry_altitude = max(35.0, 0.55 * loiter_radius)
+
+    if dist_to_goal < 0.70 * loiter_radius and alt_above_goal > loiter_entry_altitude:
+        output = ControlOutput()
+
+        radial = current_pos[:2] - goal_xy
+        radial_norm = float(np.linalg.norm(radial))
+        final_heading = self.trajectory[-1].heading
+        if radial_norm < 1e-6:
+            radial_angle = final_heading - np.pi / 2.0
+            radial = loiter_radius * np.array([np.cos(radial_angle), np.sin(radial_angle)])
+            radial_norm = loiter_radius
+        else:
+            radial_angle = float(np.arctan2(radial[1], radial[0]))
+
+        tangent_ccw = self._wrap_angle(radial_angle + np.pi / 2.0)
+        tangent_cw = self._wrap_angle(radial_angle - np.pi / 2.0)
+        err_ccw = abs(self._wrap_angle(final_heading - tangent_ccw))
+        err_cw = abs(self._wrap_angle(final_heading - tangent_cw))
+        direction = 1.0 if err_ccw <= err_cw else -1.0
+
+        tangent_heading = self._wrap_angle(radial_angle + direction * np.pi / 2.0)
+        radial_error = radial_norm - loiter_radius
+        speed_for_guidance = max(
+            current_speed if current_speed is not None else self.reference_speed,
+            0.1
+        )
+        heading_correction = -direction * np.arctan2(0.9 * radial_error, speed_for_guidance + 6.0)
+        heading_correction = float(np.clip(
+            heading_correction,
+            -self.max_cross_track_heading_correction,
+            self.max_cross_track_heading_correction
+        ))
+        target_heading = self._wrap_angle(tangent_heading + heading_correction)
+
+        output.ref_position = np.array([goal_xy[0], goal_xy[1], final_pos[2]], dtype=float)
+        output.ref_position_closest = final_pos.copy()
+        output.ref_heading = target_heading
+        output.heading_error = self._wrap_angle(target_heading - current_heading)
+        output.altitude_error = final_pos[2] - current_pos[2]
+        output.cross_track_error = radial_error
+        output.along_track_error = 0.0
+
+        adjusted_heading_ref = target_heading
+        adjusted_error = self._wrap_angle(adjusted_heading_ref - current_heading)
+        if abs(adjusted_error) > np.radians(60):
+            adjusted_heading_ref = current_heading + np.sign(adjusted_error) * np.radians(60)
+        adjusted_heading_ref = self._wrap_angle(adjusted_heading_ref)
+
+        delta_diff = self.heading_adrc.update(adjusted_heading_ref, current_heading, self.dt)
+        output.delta_asymmetric = delta_diff
+        if delta_diff > 0:
+            output.delta_left = 0.0
+            output.delta_right = np.clip(delta_diff, 0, self.max_deflection)
+        else:
+            output.delta_left = np.clip(-delta_diff, 0, self.max_deflection)
+            output.delta_right = 0.0
+        return output
+
+    return _ORIGINAL_COMPUTE_CONTROL(
+        self,
+        current_pos=current_pos,
+        current_heading=current_heading,
+        current_heading_rate=current_heading_rate,
+        current_speed=current_speed,
+    )
+
+
+ParafoilADRCController.compute_control = _compute_control_with_terminal_loiter

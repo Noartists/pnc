@@ -30,6 +30,7 @@ class ExperimentConfig:
     scene: str = "default"
     map_config: str = "cfg/map_config.yaml"
     model_config: str = "cfg/config.yaml"
+    controller: str = "adrc"
     max_planning_time: float = 30.0
     max_sim_time: float = 300.0
     
@@ -127,6 +128,7 @@ class BenchmarkRunner:
                 model_config_path=self.config.model_config,
                 seed=seed,
                 scene_name=self.config.scene,
+                controller_type=self.config.controller,
                 quiet=True  # 始终静默
             )
             
@@ -423,6 +425,9 @@ def main():
                        help='地图配置文件')
     parser.add_argument('--model-config', type=str, default='cfg/config.yaml',
                        help='模型配置文件')
+    parser.add_argument('--controller', type=str, default='adrc',
+                       choices=['adrc', 'pid'],
+                       help='controller type')
     parser.add_argument('--output-dir', type=str, default='benchmark/outputs',
                        help='输出目录')
     parser.add_argument('--resume', action='store_true',
@@ -440,6 +445,7 @@ def main():
         config.scene = args.scene
         config.map_config = args.map_config
         config.model_config = args.model_config
+        config.controller = args.controller
         
         # 解析 seeds
         if '-' in args.seeds:
